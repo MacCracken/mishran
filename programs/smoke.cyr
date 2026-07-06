@@ -1,0 +1,18 @@
+# programs/smoke.cyr — compile-time proof that src/lib.cyr links clean.
+#
+# mishran is a library — there is no CLI binary yet. This program exists so
+# `cyrius build programs/smoke.cyr build/mishran-smoke` can verify the full
+# include chain (stdlib + thread + fnptr + domain modules) parses and links
+# without error. The emitted binary writes a one-line banner and exits 0.
+
+include "src/lib.cyr"
+
+fn main(): i64 {
+    alloc_init();
+    var banner = "mishran smoke: lib.cyr linked clean\n";
+    syscall(1, 1, banner, strlen(banner));
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);

@@ -1,0 +1,76 @@
+# @public — stable API surface for mishran error handling.
+# error.cyr — mishran audio-mixer / routing error codes + Result helpers.
+#
+# MishranErr is a 16-byte record so a consumer can map a mixer failure
+# cleanly onto its own error taxonomy. Error codes are integer constants;
+# for errors that carry context (a message pointer), use
+# mishran_err_new(code, msg).
+#
+# MishranErr struct layout (16 bytes):
+#   +0: code    — error code constant (one of the MISHRAN_* below)
+#   +8: detail  — pointer to detail string (or 0)
+
+# ================================================================
+# Error code constants
+# ================================================================
+
+enum MishranErrCode {
+    MISHRAN_OK              = 0;   # no error
+    MISHRAN_ERR_OOM         = 1;   # allocation failed / ring-buffer alloc cap hit
+    MISHRAN_ERR_NO_STREAM   = 2;   # referenced stream id not registered
+    MISHRAN_ERR_FORMAT      = 3;   # unsupported/mismatched PCM format or channel count
+    MISHRAN_ERR_OVERRUN     = 4;   # ring buffer overrun (producer outran consumer)
+    MISHRAN_ERR_NO_SINK     = 5;   # no output sink open (router has no vani handle)
+    MISHRAN_ERR_UNSUPPORTED = 6;   # valid request but a feature mishran can't do yet
+    MISHRAN_ERR_OTHER       = 99;  # catch-all
+}
+
+# ================================================================
+# MishranErr struct
+# ================================================================
+
+# Create a MishranErr with code and an optional detail string (0 = none).
+fn mishran_err_new(code, detail): i64 {
+    var e = alloc(16);
+    store64(e, code);
+    store64(e + 8, detail);
+    return e;
+}
+
+# Create a MishranErr with code only (no detail).
+fn mishran_err(code): i64 {
+    return mishran_err_new(code, 0);
+}
+
+# Get the error code.
+fn mishran_err_code(e): i64 {
+    return load64(e);
+}
+
+# Get the detail string pointer (or 0).
+fn mishran_err_detail(e): i64 {
+    return load64(e + 8);
+}
+
+# ================================================================
+# Error name lookup — returns a cstring (never null).
+# ================================================================
+
+fn mishran_err_name(code): i64 {
+    if (code == MISHRAN_OK)              { return "ok"; }
+    if (code == MISHRAN_ERR_OOM)         { return "out of memory"; }
+    if (code == MISHRAN_ERR_NO_STREAM)   { return "no such stream"; }
+    if (code == MISHRAN_ERR_FORMAT)      { return "bad audio format"; }
+    if (code == MISHRAN_ERR_OVERRUN)     { return "ring buffer overrun"; }
+    if (code == MISHRAN_ERR_NO_SINK)     { return "no output sink"; }
+    if (code == MISHRAN_ERR_UNSUPPORTED) { return "unsupported feature"; }
+    if (code == MISHRAN_ERR_OTHER)       { return "other error"; }
+    return "unknown error";
+}
+
+# Print an error name to stderr (fd 2).
+fn mishran_err_print_name(code): i64 {
+    var name = mishran_err_name(code);
+    syscall(1, 2, name, strlen(name));
+    return 0;
+}

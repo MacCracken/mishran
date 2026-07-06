@@ -1,0 +1,52 @@
+[package]
+name = "mishran"
+version = "${file:VERSION}"
+description = "mishran (मिश्रण — mixing) — pure-Cyrius software audio mixer + routing server for AGNOS: fans many per-app PCM streams into one mixed/resampled output writer to vani (ALSA/OSS on Linux, snd #64-69 on agnos). Owns the single hardware writer so multi-app desktop audio works. No PulseAudio/PipeWire daemon."
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/mishran"
+language = "cyrius"
+cyrius = "6.4.7"
+
+# mishran is a library — no CLI binary yet. `cyrius build` targets a smoke
+# program that links the full include chain to prove lib.cyr parses clean.
+# Consumers (aethersafha / desktop audio clients) pull `dist/mishran.cyr`
+# via a `[deps.mishran]` entry pointing at a git tag.
+[build]
+entry = "programs/smoke.cyr"
+output = "build/mishran-smoke"
+
+# `[lib]` feeds `cyrius distlib` — module order matters: stdlib first
+# (declared in src/lib.cyr), then domain modules in dependency order.
+# error.cyr is dep-free; stream.cyr uses it; mix.cyr uses stream; route.cyr
+# owns the single sink and drives mix. Don't reorder without re-running
+# `cyrius distlib` and verifying the concatenated bundle still compiles clean.
+[lib]
+modules = [
+    "src/error.cyr",
+    "src/stream.cyr",
+    "src/mix.cyr",
+    "src/route.cyr",
+]
+
+[deps]
+# Stdlib base set for the mixer scaffold. "thread" is present now because
+# the router pump loop (route.cyr) runs on its own thread once the real
+# sink is wired; "fnptr" for the eventual per-stream callback dispatch.
+stdlib = [
+    "string",
+    "fmt",
+    "alloc",
+    "io",
+    "vec",
+    "str",
+    "syscalls",
+    "assert",
+    "bench",
+    "thread",
+    "fnptr",
+]
+
+# DEFERRED CROSS-DEP: vani (../vani) — the output sink (audio device I/O:
+# ALSA/OSS on Linux, snd syscalls #64-69 on agnos). NOT wired at scaffold.
+# Add a `[deps.vani]` path="../vani" (or a git tag) when msh_router_pump
+# opens the real hardware sink instead of the current stub.

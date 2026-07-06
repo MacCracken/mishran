@@ -1,0 +1,90 @@
+# @public — mishran the mixing kernel.
+# mix.cyr — sum many per-app streams into a single output frame buffer
+# (fan-in), plus a resample stub. This is where the "many streams → one
+# writer" fan-in actually happens numerically.
+#
+# msh_mix sums the S16 samples of `n` streams frame-by-frame into `out`
+# with a hard clamp to the S16 range so a loud overlap doesn't wrap. This
+# is a REAL (if simple) mixer body — no gain, no dither, no soft-knee yet.
+
+# S16 sample bounds. Cyrius enum members must be plain numbers (no unary
+# minus), so the minimum is expressed as `0 - 32768` inside the clamp.
+enum MshS16 {
+    MSH_S16_MAX = 32767;
+}
+
+# Clamp an accumulated i64 sample into the signed-16-bit range.
+fn msh_clamp_s16(v): i64 {
+    var lo = 0 - 32768;
+    if (v > MSH_S16_MAX) { return MSH_S16_MAX; }
+    if (v < lo) { return lo; }
+    return v;
+}
+
+# Sign-extend a raw 16-bit sample (load16 gives an unsigned 0..65535) into
+# a signed i64 so the summation arithmetic is correct.
+fn msh_sext_s16(u): i64 {
+    if (u >= 32768) { return u - 65536; }
+    return u;
+}
+
+# Mix `n` streams into `out` for `frames` interleaved frames.
+#   streams — ptr to an array of n MshStream ptrs (8 bytes each)
+#   out     — S16 output buffer, frames*channels samples
+#   frames  — frame count to produce
+# Assumes all streams share the output channel count (2 for stereo). Pulls
+# each stream's frames via msh_stream_read (missing frames read as silence),
+# sums sample-by-sample, clamps, and writes to `out`.
+# Returns MISHRAN_OK.
+# TODO(v0.2): per-stream gain, rate reconciliation via msh_resample, F32 path.
+fn msh_mix(streams, n, out, frames): i64 {
+    # Determine channel count from the first stream (default stereo).
+    var ch = 2;
+    if (n > 0) {
+        var s0 = load64(streams + 0);
+        if (s0 != 0) { ch = msh_stream_channels(s0); }
+    }
+    var total = frames * ch;
+
+    # Zero the accumulator (out doubles as the running sum in S16 space;
+    # start silent so absent streams contribute 0).
+    var i = 0;
+    while (i < total) {
+        store16(out + i * 2, 0);
+        i = i + 1;
+    }
+
+    # Scratch buffer for one stream's pull (total samples, S16).
+    var scratch = alloc(total * 2);
+    if (scratch == 0) { return MISHRAN_ERR_OOM; }
+
+    var si = 0;
+    while (si < n) {
+        var s = load64(streams + si * 8);
+        if (s != 0) {
+            var got = msh_stream_read(s, scratch, frames);
+            var got_samples = got * ch;
+            var k = 0;
+            while (k < got_samples) {
+                var acc = msh_sext_s16(load16(out + k * 2));
+                acc = acc + msh_sext_s16(load16(scratch + k * 2));
+                store16(out + k * 2, msh_clamp_s16(acc));
+                k = k + 1;
+            }
+        }
+        si = si + 1;
+    }
+    return MISHRAN_OK;
+}
+
+# Resample `src` (at in_rate, S16, mono for now) into `out` at out_rate.
+# STUB — returns MISHRAN_OK when rates match, else MISHRAN_ERR_UNSUPPORTED.
+# (`in` is a Cyrius reserved keyword, so the input buffer is named `src`.)
+# TODO(v0.2): proper linear/polyphase resampling; per-channel; anti-alias.
+fn msh_resample(src, in_rate, out, out_rate): i64 {
+    if (in_rate == 0) { return MISHRAN_ERR_FORMAT; }
+    # Placeholder: identity when rates match, else report unsupported until
+    # the real kernel lands. No samples are transformed at scaffold stage.
+    if (in_rate == out_rate) { return MISHRAN_OK; }
+    return MISHRAN_ERR_UNSUPPORTED;
+}

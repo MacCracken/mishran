@@ -1,0 +1,123 @@
+# @public — mishran the single-writer router / fan-in server.
+# route.cyr — the MshRouter owns the ONE hardware output sink (a vani
+# handle) and the list of registered app streams. It is the answer to the
+# agnos snd surface being single-writer: exactly one MshRouter holds that
+# writer, and every app's MshStream fans in behind it via msh_mix.
+#
+# Lifecycle:
+#   msh_router_new()            — allocate a router (sink not yet open)
+#   msh_router_add(r, stream)   — register an app stream, assign an id
+#   msh_router_remove(r, id)    — drop a stream by id
+#   msh_router_pump(r)          — pull each stream → msh_mix → push to sink
+#
+# The pump loop is what runs on the router's own thread once the real vani
+# sink is wired; at scaffold stage it mixes into an internal buffer and
+# stops short of the device write.
+
+# Max registered streams for the scaffold (fixed table; grows to a vec later).
+enum MshRouterCap {
+    MSH_MAX_STREAMS = 32;
+    MSH_PUMP_FRAMES = 1024;   # frames mixed per pump tick
+}
+
+# ----------------------------------------------------------------
+# MshRouter struct layout (48 bytes):
+#   +0:  sink       — vani sink handle (0 = no sink open yet)
+#   +8:  streams    — ptr to array of MSH_MAX_STREAMS stream ptrs (8 each)
+#   +16: count      — number of registered streams
+#   +24: next_id    — monotonic id allocator
+#   +32: channels   — sink channel count (default 2, stereo)
+#   +40: rate       — sink sample rate (default 48000)
+# ----------------------------------------------------------------
+
+# Allocate a router with an empty stream table and no sink.
+# Returns a MshRouter ptr, or 0 on allocation failure.
+fn msh_router_new(): i64 {
+    var r = alloc(48);
+    if (r == 0) { return 0; }
+    var tbl = alloc(MSH_MAX_STREAMS * 8);
+    if (tbl == 0) { return 0; }
+    var i = 0;
+    while (i < MSH_MAX_STREAMS) {
+        store64(tbl + i * 8, 0);
+        i = i + 1;
+    }
+    store64(r + 0, 0);            # sink — opened later via vani
+    store64(r + 8, tbl);
+    store64(r + 16, 0);          # count
+    store64(r + 24, 1);          # next_id starts at 1
+    store64(r + 32, 2);          # channels — stereo
+    store64(r + 40, 48000);      # rate
+    return r;
+}
+
+# Accessors.
+fn msh_router_sink(r): i64      { return load64(r + 0); }
+fn msh_router_streams(r): i64   { return load64(r + 8); }
+fn msh_router_count(r): i64     { return load64(r + 16); }
+fn msh_router_channels(r): i64  { return load64(r + 32); }
+fn msh_router_rate(r): i64      { return load64(r + 40); }
+
+# Register a stream. Assigns it the next id, stores it in the first free
+# slot, bumps count. Returns the assigned stream id, or MISHRAN_ERR_OOM if
+# the table is full.
+fn msh_router_add(r, stream): i64 {
+    var tbl = load64(r + 8);
+    var i = 0;
+    while (i < MSH_MAX_STREAMS) {
+        if (load64(tbl + i * 8) == 0) {
+            var id = load64(r + 24);
+            msh_stream_set_id(stream, id);
+            store64(tbl + i * 8, stream);
+            store64(r + 24, id + 1);
+            store64(r + 16, load64(r + 16) + 1);
+            return id;
+        }
+        i = i + 1;
+    }
+    return MISHRAN_ERR_OOM;
+}
+
+# Remove a stream by id. Returns MISHRAN_OK, or MISHRAN_ERR_NO_STREAM if the
+# id was not registered.
+fn msh_router_remove(r, id): i64 {
+    var tbl = load64(r + 8);
+    var i = 0;
+    while (i < MSH_MAX_STREAMS) {
+        var s = load64(tbl + i * 8);
+        if (s != 0) {
+            if (msh_stream_id(s) == id) {
+                store64(tbl + i * 8, 0);
+                store64(r + 16, load64(r + 16) - 1);
+                return MISHRAN_OK;
+            }
+        }
+        i = i + 1;
+    }
+    return MISHRAN_ERR_NO_STREAM;
+}
+
+# One pump tick: pull MSH_PUMP_FRAMES from every registered stream, mix them
+# down via msh_mix, and (eventually) push the mixed block to the vani sink.
+# At scaffold stage the sink push is stubbed — we mix into a local buffer and
+# return without a device write.
+# Returns MISHRAN_OK on a clean mix, or an error code.
+# TODO: open the vani sink in msh_router_new / a msh_router_open(r); push the
+#       mixed buffer with vani's device-write; run this loop on a thread.
+fn msh_router_pump(r): i64 {
+    var ch = load64(r + 32);
+    var total = MSH_PUMP_FRAMES * ch;
+    var mixbuf = alloc(total * 2);
+    if (mixbuf == 0) { return MISHRAN_ERR_OOM; }
+
+    var streams = load64(r + 8);
+    var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES);
+    if (rc != MISHRAN_OK) { return rc; }
+
+    # TODO: push `mixbuf` (total samples, S16) to the vani sink here. Until
+    # the sink is wired, signal that there is no output sink so callers know
+    # the block was mixed but not emitted.
+    var sink = load64(r + 0);
+    if (sink == 0) { return MISHRAN_ERR_NO_SINK; }
+    return MISHRAN_OK;
+}

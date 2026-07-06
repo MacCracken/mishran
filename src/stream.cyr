@@ -1,0 +1,131 @@
+# @public — mishran per-app PCM stream + ring buffer.
+# stream.cyr — a single application's audio stream: an id, a PCM format
+# descriptor, and a lock-light single-producer/single-consumer ring buffer
+# of interleaved sample frames feeding the mixer.
+#
+# One MshStream per sounding application. The app is the producer
+# (msh_stream_write); the router pump is the consumer (msh_stream_read).
+# Frames are interleaved: `channels` samples per frame. The ring stores
+# raw samples (S16 = 2 bytes/sample via store16/load16); cap/head/tail are
+# measured in SAMPLES so the frame math is `frames * channels`.
+
+# ----------------------------------------------------------------
+# MshFormat — sample encoding tag.
+# ----------------------------------------------------------------
+enum MshFormat {
+    MSH_FMT_S16 = 0;   # signed 16-bit little-endian PCM (2 bytes/sample)
+    MSH_FMT_F32 = 1;   # 32-bit float PCM (4 bytes/sample) — TODO(v0.2)
+}
+
+# ----------------------------------------------------------------
+# MshStream struct layout (56 bytes):
+#   +0:  id           — stream id (assigned by the router)
+#   +8:  format       — MshFormat tag
+#   +16: sample_rate  — frames per second (e.g. 48000)
+#   +24: channels     — interleaved channel count (1 = mono, 2 = stereo)
+#   +32: ring         — ptr to sample ring buffer (cap samples)
+#   +40: cap          — ring capacity in SAMPLES
+#   +48: head         — write cursor (samples, mod cap)
+#   +56: tail         — read cursor  (samples, mod cap)
+# ----------------------------------------------------------------
+
+# Bytes-per-sample for a format. Returns 0 for an unknown tag.
+fn msh_format_bytes(fmt): i64 {
+    if (fmt == MSH_FMT_S16) { return 2; }
+    if (fmt == MSH_FMT_F32) { return 4; }
+    return 0;
+}
+
+# Allocate a new S16 stream with a ring sized for `ring_frames` frames.
+# Returns a MshStream ptr, or 0 on allocation failure.
+fn msh_stream_new(rate, ch): i64 {
+    var s = alloc(64);
+    if (s == 0) { return 0; }
+    store64(s + 0, 0);              # id — router assigns on add
+    store64(s + 8, MSH_FMT_S16);
+    store64(s + 16, rate);
+    store64(s + 24, ch);
+    # Default ring: 4096 frames * channels samples, 2 bytes each (S16).
+    var cap = 4096 * ch;
+    if (cap == 0) { cap = 4096; }
+    var ring = alloc(cap * 2);
+    if (ring == 0) { return 0; }
+    store64(s + 32, ring);
+    store64(s + 40, cap);
+    store64(s + 48, 0);            # head
+    store64(s + 56, 0);            # tail
+    return s;
+}
+
+# Accessors.
+fn msh_stream_id(s): i64          { return load64(s + 0); }
+fn msh_stream_set_id(s, id): i64  { store64(s + 0, id); return 0; }
+fn msh_stream_format(s): i64      { return load64(s + 8); }
+fn msh_stream_rate(s): i64        { return load64(s + 16); }
+fn msh_stream_channels(s): i64    { return load64(s + 24); }
+fn msh_stream_ring(s): i64        { return load64(s + 32); }
+fn msh_stream_cap(s): i64         { return load64(s + 40); }
+fn msh_stream_head(s): i64        { return load64(s + 48); }
+fn msh_stream_tail(s): i64        { return load64(s + 56); }
+
+# Samples currently readable in the ring (head - tail, mod cap).
+fn msh_stream_avail(s): i64 {
+    var head = load64(s + 48);
+    var tail = load64(s + 56);
+    var cap = load64(s + 40);
+    var d = head - tail;
+    if (d < 0) { d = d + cap; }
+    return d;
+}
+
+# Write `frames` interleaved frames from `buf` (S16 samples) into the ring.
+# Returns the number of frames actually written (may be short on overrun).
+# TODO(v0.2): format conversion (F32→S16), proper overrun policy / drop-oldest.
+fn msh_stream_write(s, buf, frames): i64 {
+    var ch = load64(s + 24);
+    var ring = load64(s + 32);
+    var cap = load64(s + 40);
+    var head = load64(s + 48);
+    var tail = load64(s + 56);
+    var want = frames * ch;
+    var i = 0;
+    while (i < want) {
+        var next = head + 1;
+        if (next == cap) { next = 0; }
+        if (next == tail) {
+            # Ring full — stop (overrun). Return frames written so far.
+            store64(s + 48, head);
+            return i / ch;
+        }
+        store16(ring + head * 2, load16(buf + i * 2));
+        head = next;
+        i = i + 1;
+    }
+    store64(s + 48, head);
+    return frames;
+}
+
+# Read up to `frames` interleaved frames from the ring into `out` (S16).
+# Returns the number of frames actually read (short if the ring underflows;
+# the caller/mixer treats missing frames as silence).
+fn msh_stream_read(s, out, frames): i64 {
+    var ch = load64(s + 24);
+    var ring = load64(s + 32);
+    var cap = load64(s + 40);
+    var head = load64(s + 48);
+    var tail = load64(s + 56);
+    var want = frames * ch;
+    var i = 0;
+    while (i < want) {
+        if (tail == head) {
+            store64(s + 56, tail);
+            return i / ch;
+        }
+        store16(out + i * 2, load16(ring + tail * 2));
+        tail = tail + 1;
+        if (tail == cap) { tail = 0; }
+        i = i + 1;
+    }
+    store64(s + 56, tail);
+    return frames;
+}

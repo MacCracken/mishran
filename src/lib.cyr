@@ -1,0 +1,42 @@
+# @public — mishran library include chain.
+# mishran (मिश्रण — mixing / mixture) — pure-Cyrius software audio mixer +
+# routing server. Fans many per-app PCM streams into ONE mixed/resampled
+# output writer to vani (ALSA/OSS on Linux, snd #64-69 on agnos). Owns the
+# single hardware writer so a desktop with more than one sounding app works
+# — PulseAudio/PipeWire's role done sovereignly with no daemon bloat.
+#
+# Stdlib includes live ONLY in this file — domain modules are flat, which
+# is what makes `cyrius distlib` (strip-include concatenation) produce a
+# compile-clean `dist/mishran.cyr`. Don't add stdlib includes in individual
+# src/*.cyr files.
+
+# ================================================================
+# Standard library
+# ================================================================
+include "lib/string.cyr"
+include "lib/fmt.cyr"
+include "lib/alloc.cyr"
+include "lib/vec.cyr"
+include "lib/str.cyr"
+include "lib/io.cyr"
+include "lib/syscalls.cyr"
+include "lib/assert.cyr"
+include "lib/bench.cyr"
+
+# thread.cyr (mutex_* / clone-based) precedes fnptr — the router pump loop
+# runs on its own thread once the real vani sink is wired, and per-stream
+# callback dispatch goes through fnptr.
+include "lib/thread.cyr"
+include "lib/fnptr.cyr"
+
+# ================================================================
+# mishran domain modules — flat, dependency order.
+# error.cyr is dep-free. stream.cyr (MshStream + ring buffer) builds on
+# error.cyr; mix.cyr (msh_mix fan-in + resample stub) consumes streams;
+# route.cyr (MshRouter — the single-writer sink owner) drives mix over its
+# registered streams.
+# ================================================================
+include "src/error.cyr"
+include "src/stream.cyr"
+include "src/mix.cyr"
+include "src/route.cyr"
