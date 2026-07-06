@@ -30,6 +30,20 @@ include "lib/thread.cyr"
 include "lib/fnptr.cyr"
 
 # ================================================================
+# vani — the audio output sink (core `audio_*` PCM shim).
+# VENDORED single file (vendor/vani-core.cyr) produced from vani's
+# `dist/vani-core.cyr` bundle, NOT a git `[deps.vani]` dep: since vani's
+# 0.9.9 all-stdlib cut, resolving vani as a git dep drags in its whole
+# `[deps].stdlib` (yukti/patra/chrono) even though the core shim only needs
+# the base stdlib set already declared above. Vendoring compiles just the shim
+# against mishran's own stdlib list. Mirrors cyrius-doom / -polyomino / -bb.
+# (Provenance: vani 1.0.0.) route.cyr calls audio_open_playback /
+# audio_set_params / audio_write / audio_prepare / audio_drain / audio_close,
+# so this must precede src/route.cyr.
+# ================================================================
+include "vendor/vani-core.cyr"
+
+# ================================================================
 # mishran domain modules — flat, dependency order.
 # error.cyr is dep-free. stream.cyr (MshStream + ring buffer) builds on
 # error.cyr; mix.cyr (msh_mix fan-in + resample stub) consumes streams;

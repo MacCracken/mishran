@@ -1,0 +1,67 @@
+# programs/pump_probe.cyr — real-hardware proof that mishran's router drives a
+# live vani sink end-to-end. Creates a router, registers one silent stereo
+# stream, opens the vani PCM sink (card 1 device 0 by default — the vani
+# convention), pumps a handful of ticks (writing mixed silence through
+# audio_write with XRUN recovery), then drains + closes. Silent by design (the
+# empty stream mixes to silence) — it exercises msh_router_open / _pump /
+# _close against real /dev/snd without emitting an audible tone, mirroring
+# vani's own silent probe/throughput programs.
+#
+# Exit codes: 0 = pumped + drained clean; 1 = alloc failure; 2 = sink would not
+# open (no hardware / device busy — degrade-clean, not a bug); 3 = a pump tick
+# failed after the sink opened.
+
+include "src/lib.cyr"
+
+enum PumpProbe {
+    PROBE_CARD   = 1;
+    PROBE_DEVICE = 0;
+    PROBE_TICKS  = 16;
+}
+
+fn _say(msg): i64 {
+    syscall(1, 1, msg, strlen(msg));
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    var r = msh_router_new();
+    if (r == 0) { _say("pump_probe: router alloc failed\n"); return 1; }
+
+    # One silent stream at the router's rate/channels — its ring stays empty,
+    # so msh_mix produces silence and we prove the write path without noise.
+    var s = msh_stream_new(msh_router_rate(r), msh_router_channels(r));
+    if (s == 0) { _say("pump_probe: stream alloc failed\n"); return 1; }
+    msh_router_add(r, s);
+
+    var rc = msh_router_open(r, PROBE_CARD, PROBE_DEVICE);
+    if (rc != MISHRAN_OK) {
+        _say("pump_probe: sink open failed (");
+        var nm = mishran_err_name(rc);
+        syscall(1, 1, nm, strlen(nm));
+        _say(") — no hardware or device busy\n");
+        return 2;
+    }
+
+    var i = 0;
+    var pumped = 0;
+    while (i < PROBE_TICKS) {
+        var pr = msh_router_pump(r);
+        if (pr == MISHRAN_OK) { pumped = pumped + 1; }
+        i = i + 1;
+    }
+
+    msh_router_close(r);
+
+    if (pumped < PROBE_TICKS) {
+        _say("pump_probe: a pump tick failed after sink open\n");
+        return 3;
+    }
+    _say("pump_probe: sink opened, ticks pumped, drained + closed clean\n");
+    return 0;
+}
+
+var exit_code = main();
+syscall(60, exit_code);
