@@ -1,0 +1,55 @@
+# programs/resample_probe.cyr — numeric proof of mishran's linear resampler and
+# the per-stream rate reconciliation in msh_mix. Pure integer math (identical on
+# every target), so a deterministic host run fully validates it. Exit 0 = PASS.
+
+include "src/lib.cyr"
+
+fn rp_s(buf, i): i64 { return msh_sext_s16(load16(buf + i * 2)); }
+
+fn main(): i64 {
+    alloc_init();
+    var fails = 0;
+
+    # --- upsample 2x (24k -> 48k), mono ramp [0,100,200,300] ---
+    # expect linear interpolation: [0,50,100,150,200,250,300,300]
+    var src = alloc(4 * 2);
+    store16(src + 0, 0); store16(src + 2, 100); store16(src + 4, 200); store16(src + 6, 300);
+    var up = alloc(8 * 2);
+    var uf = msh_resample(src, 4, 24000, up, 8, 48000, 1);
+    if (uf != 8) { fails = fails + 1; }
+    var exp = alloc(8 * 2);
+    store16(exp + 0, 0);   store16(exp + 2, 50);   store16(exp + 4, 100);  store16(exp + 6, 150);
+    store16(exp + 8, 200); store16(exp + 10, 250); store16(exp + 12, 300); store16(exp + 14, 300);
+    var i = 0;
+    while (i < 8) { if (rp_s(up, i) != rp_s(exp, i)) { fails = fails + 1; } i = i + 1; }
+
+    # --- downsample 2x (48k -> 24k): [0,100,200,300] -> [0,200] ---
+    var dn = alloc(4 * 2);
+    var df = msh_resample(src, 4, 48000, dn, 4, 24000, 1);
+    if (df != 2) { fails = fails + 1; }
+    if (rp_s(dn, 0) != 0)   { fails = fails + 1; }
+    if (rp_s(dn, 1) != 200) { fails = fails + 1; }
+
+    # --- mix rate-reconcile: a 24k stream through a 48k sink stays constant ---
+    var st = msh_stream_new(24000, 1);
+    var tone = alloc(4 * 2);
+    store16(tone + 0, 1000); store16(tone + 2, 1000); store16(tone + 4, 1000); store16(tone + 6, 1000);
+    msh_stream_write(st, tone, 4);
+    var streams = alloc(1 * 8); store64(streams + 0, st);
+    var mixout = alloc(8 * 2);
+    msh_mix(streams, 1, mixout, 8, 48000);
+    if (rp_s(mixout, 0) != 1000) { fails = fails + 1; }
+    if (rp_s(mixout, 7) != 1000) { fails = fails + 1; }
+
+    if (fails == 0) {
+        var ok = "mishran resample_probe: PASS (upsample + downsample + mix rate-reconcile)\n";
+        syscall(1, 1, ok, strlen(ok));
+        return 0;
+    }
+    var bad = "mishran resample_probe: FAIL\n";
+    syscall(1, 1, bad, strlen(bad));
+    return 1;
+}
+
+var rc = main();
+syscall(60, rc);

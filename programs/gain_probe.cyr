@@ -31,7 +31,7 @@ fn main(): i64 {
     var streams = alloc(2 * 8);
     store64(streams + 0, a); store64(streams + 8, b);
     var out = alloc(4 * 2);
-    msh_mix(streams, 2, out, 4);
+    msh_mix(streams, 2, out, 4, 48000);
     var i = 0;
     while (i < 4) { if (gp_sample(out, i) != 1500) { fails = fails + 1; } i = i + 1; }
 
@@ -47,7 +47,7 @@ fn main(): i64 {
     msh_stream_set_gain(c, 512);          # +6 dB (2x)
     var st1 = alloc(1 * 8); store64(st1 + 0, c);
     var out1 = alloc(2 * 2);
-    msh_mix(st1, 1, out1, 2);
+    msh_mix(st1, 1, out1, 2, 48000);
     if (gp_sample(out1, 0) != 32767) { fails = fails + 1; }
 
     # --- mute: gain 0 -> silence ---
@@ -56,7 +56,7 @@ fn main(): i64 {
     msh_stream_set_gain(d, 0);
     var st2 = alloc(1 * 8); store64(st2 + 0, d);
     var out2 = alloc(4 * 2);
-    msh_mix(st2, 1, out2, 4);
+    msh_mix(st2, 1, out2, 4, 48000);
     if (gp_sample(out2, 0) != 0) { fails = fails + 1; }
 
     if (fails == 0) {

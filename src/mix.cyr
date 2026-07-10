@@ -29,17 +29,50 @@ fn msh_sext_s16(u): i64 {
     return u;
 }
 
-# Mix `n` streams into `out` for `frames` interleaved frames.
-#   streams — ptr to an array of n MshStream ptrs (8 bytes each)
-#   out     — S16 output buffer, frames*channels samples
-#   frames  — frame count to produce
-# Assumes all streams share the output channel count (2 for stereo). Pulls
-# each stream's frames via msh_stream_read (missing frames read as silence),
-# sums sample-by-sample, clamps, and writes to `out`.
+# Linear-resample `src_frames` interleaved S16 frames (`ch` channels) at
+# `in_rate` into `out` at `out_rate`, up to `out_cap` frames. Per-channel
+# linear interpolation via an integer phase accumulator (no float): output
+# frame o samples source position o*in_rate/out_rate, interpolating between the
+# two nearest source frames. Returns the output frame count produced
+# (= src_frames*out_rate/in_rate, capped at out_cap); in_rate == out_rate is a
+# straight copy. (`in` is a Cyrius keyword, hence `src`.)
+# TODO(v0.2): polyphase / anti-alias filtering on downsample; F32 path.
+fn msh_resample(src, src_frames, in_rate, out, out_cap, out_rate, ch): i64 {
+    if (in_rate == 0) { return 0; }
+    if (src_frames <= 0) { return 0; }
+    var out_frames = (src_frames * out_rate) / in_rate;
+    if (out_frames > out_cap) { out_frames = out_cap; }
+    var o = 0;
+    while (o < out_frames) {
+        var posn = o * in_rate;                 # source position numerator (out_rate units)
+        var idx = posn / out_rate;              # floor source frame
+        var rem = posn - idx * out_rate;        # fractional numerator, [0, out_rate)
+        var idx1 = idx + 1;
+        if (idx1 >= src_frames) { idx1 = src_frames - 1; }
+        var c = 0;
+        while (c < ch) {
+            var s0 = msh_sext_s16(load16(src + (idx * ch + c) * 2));
+            var s1 = msh_sext_s16(load16(src + (idx1 * ch + c) * 2));
+            var interp = s0 + ((s1 - s0) * rem) / out_rate;
+            store16(out + (o * ch + c) * 2, msh_clamp_s16(interp));
+            c = c + 1;
+        }
+        o = o + 1;
+    }
+    return out_frames;
+}
+
+# Mix `n` streams into `out` for `frames` interleaved frames at `sink_rate`.
+#   streams   — ptr to an array of n MshStream ptrs (8 bytes each)
+#   out       — S16 output buffer, frames*channels samples
+#   frames    — frame count to produce (at the sink rate)
+#   sink_rate — the router output rate; a stream at a different rate is
+#               linear-resampled to it via msh_resample before summing.
+# Channel count comes from the first stream (default stereo). Each stream is
+# scaled by its per-stream Q8 gain, summed sample-by-sample, and clamped.
 # Returns MISHRAN_OK.
-# TODO(v0.2): rate reconciliation via msh_resample, F32 path.
-fn msh_mix(streams, n, out, frames): i64 {
-    # Determine channel count from the first stream (default stereo).
+# TODO(v0.2): F32 path; reuse router-owned scratch instead of the per-call alloc.
+fn msh_mix(streams, n, out, frames, sink_rate): i64 {
     var ch = 2;
     if (n > 0) {
         var s0 = load64(streams + 0);
@@ -47,15 +80,13 @@ fn msh_mix(streams, n, out, frames): i64 {
     }
     var total = frames * ch;
 
-    # Zero the accumulator (out doubles as the running sum in S16 space;
-    # start silent so absent streams contribute 0).
+    # Zero the accumulator (out doubles as the running sum in S16 space).
     var i = 0;
     while (i < total) {
         store16(out + i * 2, 0);
         i = i + 1;
     }
 
-    # Scratch buffer for one stream's pull (total samples, S16).
     var scratch = alloc(total * 2);
     if (scratch == 0) { return MISHRAN_ERR_OOM; }
 
@@ -64,8 +95,21 @@ fn msh_mix(streams, n, out, frames): i64 {
         var s = load64(streams + si * 8);
         if (s != 0) {
             var g = msh_stream_gain(s);              # Q8 per-stream volume (256 = unity)
-            var got = msh_stream_read(s, scratch, frames);
-            var got_samples = got * ch;
+            var srate = msh_stream_rate(s);
+            var got_frames = 0;
+            if (srate == sink_rate) {
+                got_frames = msh_stream_read(s, scratch, frames);
+            } else {
+                # Pull the source frames that map to `frames` output frames, then
+                # linear-resample them up/down to the sink rate into scratch.
+                var in_frames = (frames * srate) / sink_rate;
+                if (in_frames < 1) { in_frames = 1; }
+                var inbuf = alloc(in_frames * ch * 2);
+                if (inbuf == 0) { return MISHRAN_ERR_OOM; }
+                var pulled = msh_stream_read(s, inbuf, in_frames);
+                got_frames = msh_resample(inbuf, pulled, srate, scratch, frames, sink_rate, ch);
+            }
+            var got_samples = got_frames * ch;
             var k = 0;
             while (k < got_samples) {
                 var acc = msh_sext_s16(load16(out + k * 2));
@@ -92,16 +136,4 @@ fn msh_apply_gain(buf, count, gain): i64 {
         i = i + 1;
     }
     return MISHRAN_OK;
-}
-
-# Resample `src` (at in_rate, S16, mono for now) into `out` at out_rate.
-# STUB — returns MISHRAN_OK when rates match, else MISHRAN_ERR_UNSUPPORTED.
-# (`in` is a Cyrius reserved keyword, so the input buffer is named `src`.)
-# TODO(v0.2): proper linear/polyphase resampling; per-channel; anti-alias.
-fn msh_resample(src, in_rate, out, out_rate): i64 {
-    if (in_rate == 0) { return MISHRAN_ERR_FORMAT; }
-    # Placeholder: identity when rates match, else report unsupported until
-    # the real kernel lands. No samples are transformed at scaffold stage.
-    if (in_rate == out_rate) { return MISHRAN_OK; }
-    return MISHRAN_ERR_UNSUPPORTED;
 }

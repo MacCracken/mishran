@@ -5,10 +5,21 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - unreleased
+## [0.3.0] - 2026-07-10
+
+First tagged release — the pre-1.0 mixing kernel. Rolls up the previously-unreleased
+0.1.0 scaffold and 0.2.0 sink/gain work plus the resampler below.
 
 ### Added
 
+- **Linear resampler + per-stream rate reconciliation.** `msh_resample` is now a real
+  per-channel linear interpolator (integer phase accumulator, no float): it up/downsamples
+  an S16 block from any input rate to the sink rate. `msh_mix` gained a `sink_rate` argument
+  and reconciles each stream to it — a stream at 44.1k (or any rate) is resampled to the
+  router's 48k before the gain-scaled sum, so heterogeneous app streams fan in correctly
+  (what a player like jalwa needs). Verified by `programs/resample_probe.cyr`: 2× upsample
+  interpolates exactly, 2× downsample decimates, and a 24k stream through a 48k sink stays
+  constant. Anti-alias filtering on downsample + an F32 path remain TODO.
 - **Per-stream + master gain — "control outputs."** Each `MshStream` now carries a
   Q8 fixed-point gain (`+64`; 256 = unity, 128 = -6 dB, 512 = +6 dB, 0 = mute), and
   `msh_mix` scales every stream by its gain during fan-in. The `MshRouter` carries a

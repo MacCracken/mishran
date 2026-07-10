@@ -139,7 +139,7 @@ fn msh_router_pump(r): i64 {
     if (mixbuf == 0) { return MISHRAN_ERR_OOM; }
 
     var streams = load64(r + 8);
-    var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES);
+    var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES, load64(r + 40));
     if (rc != MISHRAN_OK) { return rc; }
 
     # Apply the master output level to the mixed block (Q8; no-op at unity).
