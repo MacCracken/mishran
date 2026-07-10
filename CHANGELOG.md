@@ -5,6 +5,24 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Routing server + app client — apps route THROUGH the mixer.** mishran gains a TCP-loopback
+  server (port 7701) so many apps share the one vani writer instead of each grabbing it — the
+  reason the mixer exists. New modules: **`proto.cyr`** (wire messages — `HELLO`/`WELCOME`/
+  `WRITE`/`GAIN`/`BYE`, 8-byte words plus a raw S16 PCM payload after `WRITE`), **`transport.cyr`**
+  (listen/accept/connect/send/recv over cyrius `net.cyr` — cross-platform: Linux BSD sockets +
+  agnos TCP band #47/#56/#57, modeled 1:1 on setu's transport), and **`server.cyr`** — an
+  `MshServer` that accepts clients, maps each to one `MshStream`, and dispatches
+  `HELLO`→register / `WRITE`→ring / `GAIN`→volume / `BYE`→drop, plus the app-facing
+  `msh_client_connect`/`_write`/`_gain`/`_close` library a player like jalwa links.
+  `msh_server_poll` services every client non-blocking alongside `msh_router_pump`. Verified by
+  `programs/serve_probe.cyr` over real loopback (single-process, no fork): connect → HELLO/WELCOME,
+  a WRITE + PCM payload lands in the router's stream ring (samples = 1234), and GAIN is applied
+  (= 128) — all green; builds `--agnos`. Added `result` + `net` to the stdlib set.
+
 ## [0.3.0] - 2026-07-10
 
 First tagged release — the pre-1.0 mixing kernel. Rolls up the previously-unreleased

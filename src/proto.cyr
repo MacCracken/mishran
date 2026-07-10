@@ -1,0 +1,75 @@
+# @public — mishran the wire protocol.
+# proto.cyr — the message format spoken between an app (client) and the mishran
+# router (server) over TCP loopback (see transport.cyr). Modeled on setu's
+# codec/proto: a message is 8-byte words — kind, argc, then argc args. The
+# MSH_WRITE opcode is followed on the wire by a raw S16 PCM payload
+# (nframes * channels * 2 bytes) that is NOT part of the message struct.
+#
+# proto.cyr is dep-free (no stdlib beyond load64/store64/alloc) so it sits at the
+# head of the server modules in the include chain.
+
+enum MshOp {
+    MSH_HELLO   = 1;   # C->S: args [rate, channels] — register a stream
+    MSH_WELCOME = 2;   # S->C: args [stream_id]      — assigned id
+    MSH_WRITE   = 3;   # C->S: args [nframes] + PCM payload (nframes*ch*2 bytes)
+    MSH_GAIN    = 4;   # C->S: args [gain_q8]         — set this stream's volume
+    MSH_BYE     = 5;   # C->S: no args               — disconnect
+    MSH_ERR     = 6;   # S->C: args [code]           — protocol error
+}
+
+# A message: kind (+0), argc (+8), up to MSH_MAX_ARGS args (+16..). 48 bytes.
+enum MshProto {
+    MSH_MAX_ARGS = 4;
+    MSH_MSG_SZ   = 48;
+    MSH_HDR      = 16;   # kind + argc, 8 bytes each
+}
+
+fn msh_msg_new(): i64 {
+    var m = alloc(MSH_MSG_SZ);
+    store64(m + 0, 0);
+    store64(m + 8, 0);
+    return m;
+}
+
+fn msh_msg_kind(m): i64    { return load64(m + 0); }
+fn msh_msg_argc(m): i64    { return load64(m + 8); }
+fn msh_msg_arg(m, i): i64  { return load64(m + 16 + i * 8); }
+
+# Set kind + argc; args go in via msh_msg_set_arg.
+fn msh_msg_set(m, kind, argc): i64 {
+    store64(m + 0, kind);
+    store64(m + 8, argc);
+    return 0;
+}
+fn msh_msg_set_arg(m, i, v): i64 { store64(m + 16 + i * 8, v); return 0; }
+
+# Encode `m` into `buf` (cap bytes). Returns the byte length ((2+argc)*8), or -1
+# on a bad argc / insufficient cap.
+fn msh_encode(m, buf, cap): i64 {
+    var argc = load64(m + 8);
+    if (argc < 0) { return 0 - 1; }
+    if (argc > MSH_MAX_ARGS) { return 0 - 1; }
+    var total = (2 + argc) * 8;
+    if (total > cap) { return 0 - 1; }
+    store64(buf + 0, load64(m + 0));
+    store64(buf + 8, argc);
+    var i = 0;
+    while (i < argc) { store64(buf + 16 + i * 8, load64(m + 16 + i * 8)); i = i + 1; }
+    return total;
+}
+
+# Decode a message from `buf` (n bytes) into `m`. Returns the total byte length,
+# or -1 on a short buffer / bad argc.
+fn msh_decode(buf, n, m): i64 {
+    if (n < 16) { return 0 - 1; }
+    var argc = load64(buf + 8);
+    if (argc < 0) { return 0 - 1; }
+    if (argc > MSH_MAX_ARGS) { return 0 - 1; }
+    var total = (2 + argc) * 8;
+    if (n < total) { return 0 - 1; }
+    store64(m + 0, load64(buf + 0));
+    store64(m + 8, argc);
+    var i = 0;
+    while (i < argc) { store64(m + 16 + i * 8, load64(buf + 16 + i * 8)); i = i + 1; }
+    return total;
+}

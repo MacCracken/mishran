@@ -1,0 +1,201 @@
+# @public — mishran the routing SERVER + the app-facing client.
+# server.cyr — the piece that lets many apps ROUTE through the mixer instead of
+# each grabbing the single vani writer. The server owns an MshRouter + a listener
+# (transport.cyr) and maps each connected client to one MshStream. A client
+# (jalwa, a game, …) connects, HELLOs its format, and streams PCM + gain; the
+# server writes each into its stream's ring, and msh_router_pump mixes them all
+# down to the one hardware sink.
+#
+# Depends on route.cyr (the router), stream.cyr (the per-client stream),
+# transport.cyr (TCP), and proto.cyr (the wire messages).
+
+enum MshServerConf { MSH_MAX_CLIENTS = 16; }
+
+# MshServer: +0 listen fd, +8 router, +16 clients table ptr.
+# clients table: MSH_MAX_CLIENTS slots of [fd (+0), stream (+8)] = 16 bytes each
+# (fd == 0 = free slot; stream == 0 = accepted but not yet HELLO'd).
+
+# Create a server around `router`: bind + listen. Returns a *MshServer, or 0 if
+# the listener could not be opened.
+fn msh_server_new(router): i64 {
+    var lfd = msh_listen();
+    if (lfd < 0) { return 0; }
+    var s = alloc(24);
+    var tbl = alloc(MSH_MAX_CLIENTS * 16);
+    var i = 0;
+    while (i < MSH_MAX_CLIENTS) {
+        store64(tbl + i * 16, 0);
+        store64(tbl + i * 16 + 8, 0);
+        i = i + 1;
+    }
+    store64(s + 0, lfd);
+    store64(s + 8, router);
+    store64(s + 16, tbl);
+    return s;
+}
+
+fn msh_server_lfd(s): i64    { return load64(s + 0); }
+fn msh_server_router(s): i64 { return load64(s + 8); }
+
+# Register an accepted client fd in the first free slot (stream = 0 until HELLO).
+# Returns 0, or -1 (table full → fd closed).
+fn msh_server_add_client(s, fd): i64 {
+    var tbl = load64(s + 16);
+    var i = 0;
+    while (i < MSH_MAX_CLIENTS) {
+        if (load64(tbl + i * 16) == 0) {
+            store64(tbl + i * 16, fd);
+            store64(tbl + i * 16 + 8, 0);
+            return 0;
+        }
+        i = i + 1;
+    }
+    sock_close(fd);
+    return 0 - 1;
+}
+
+# Drop a client slot: unregister its stream from the router (if any) + close fd.
+fn msh_server_drop(s, slot): i64 {
+    var st = load64(slot + 8);
+    if (st != 0) { msh_router_remove(load64(s + 8), msh_stream_id(st)); }
+    var fd = load64(slot + 0);
+    if (fd != 0) { sock_close(fd); }
+    store64(slot + 0, 0);
+    store64(slot + 8, 0);
+    return 0;
+}
+
+# Service one client slot: read + dispatch one pending message (non-blocking).
+# HELLO → new stream + WELCOME; WRITE → read PCM payload into the ring; GAIN →
+# set the stream volume; BYE / EOF → drop. Returns 0.
+fn msh_server_service(s, slot): i64 {
+    var fd = load64(slot + 0);
+    var m = msh_msg_new();
+    var r = msh_try_read_msg(fd, m);
+    if (r == 0) { return 0; }                        # nothing pending
+    if (r < 0) { msh_server_drop(s, slot); return 0; } # EOF / error
+    var kind = msh_msg_kind(m);
+    if (kind == MSH_HELLO) {
+        var st = msh_stream_new(msh_msg_arg(m, 0), msh_msg_arg(m, 1));
+        var id = msh_router_add(load64(s + 8), st);
+        store64(slot + 8, st);
+        var w = msh_msg_new();
+        msh_msg_set(w, MSH_WELCOME, 1);
+        msh_msg_set_arg(w, 0, id);
+        msh_send(fd, w);
+        return 0;
+    }
+    var stream = load64(slot + 8);
+    if (kind == MSH_WRITE) {
+        if (stream == 0) { return 0; }               # WRITE before HELLO — ignore
+        var nframes = msh_msg_arg(m, 0);
+        var nbytes = nframes * msh_stream_channels(stream) * 2;
+        var pcm = alloc(nbytes);
+        if (msh_read_exact(fd, pcm, nbytes) < 0) { msh_server_drop(s, slot); return 0; }
+        msh_stream_write(stream, pcm, nframes);
+        return 0;
+    }
+    if (kind == MSH_GAIN) {
+        if (stream != 0) { msh_stream_set_gain(stream, msh_msg_arg(m, 0)); }
+        return 0;
+    }
+    if (kind == MSH_BYE) {
+        msh_server_drop(s, slot);
+        return 0;
+    }
+    return 0;
+}
+
+# Poll the server: accept one new client, then service every registered client
+# once. Non-blocking — call each tick alongside msh_router_pump. Returns 0.
+fn msh_server_poll(s): i64 {
+    var cfd = msh_accept(load64(s + 0));
+    if (cfd >= 0) { msh_server_add_client(s, cfd); }
+    var tbl = load64(s + 16);
+    var i = 0;
+    while (i < MSH_MAX_CLIENTS) {
+        if (load64(tbl + i * 16) != 0) { msh_server_service(s, tbl + i * 16); }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Close the server: drop all clients + close the listener. Returns 0.
+fn msh_server_close(s): i64 {
+    var tbl = load64(s + 16);
+    var i = 0;
+    while (i < MSH_MAX_CLIENTS) {
+        if (load64(tbl + i * 16) != 0) { msh_server_drop(s, tbl + i * 16); }
+        i = i + 1;
+    }
+    sock_close(load64(s + 0));
+    return 0;
+}
+
+# =========================================================================
+# MshClient — the app-facing API: connect, write PCM, set gain, close.
+# =========================================================================
+
+enum MshClientOff {
+    MSH_CL_FD   = 0;
+    MSH_CL_ID   = 8;
+    MSH_CL_RATE = 16;
+    MSH_CL_CH   = 24;
+    MSH_CL_SZ   = 32;
+}
+
+# Connect to the mishran server + register a stream at rate/channels: sends HELLO,
+# awaits WELCOME(stream_id). Returns a *MshClient, or 0 on failure.
+fn msh_client_connect(rate, ch): i64 {
+    var fd = msh_connect();
+    if (fd < 0) { return 0; }
+    var h = msh_msg_new();
+    msh_msg_set(h, MSH_HELLO, 2);
+    msh_msg_set_arg(h, 0, rate);
+    msh_msg_set_arg(h, 1, ch);
+    if (msh_send(fd, h) < 0) { sock_close(fd); return 0; }
+    var w = msh_msg_new();
+    if (msh_read_msg(fd, w) < 0) { sock_close(fd); return 0; }
+    if (msh_msg_kind(w) != MSH_WELCOME) { sock_close(fd); return 0; }
+    var c = alloc(MSH_CL_SZ);
+    store64(c + MSH_CL_FD, fd);
+    store64(c + MSH_CL_ID, msh_msg_arg(w, 0));
+    store64(c + MSH_CL_RATE, rate);
+    store64(c + MSH_CL_CH, ch);
+    return c;
+}
+
+fn msh_client_fd(c): i64 { return load64(c + MSH_CL_FD); }
+fn msh_client_id(c): i64 { return load64(c + MSH_CL_ID); }
+
+# Write `nframes` interleaved S16 frames from `pcm` to the client's stream.
+# Returns 0, or -7 on a send error.
+fn msh_client_write(c, pcm, nframes): i64 {
+    var fd = load64(c + MSH_CL_FD);
+    var m = msh_msg_new();
+    msh_msg_set(m, MSH_WRITE, 1);
+    msh_msg_set_arg(m, 0, nframes);
+    if (msh_send(fd, m) < 0) { return 0 - 7; }
+    if (msh_write_all(fd, pcm, nframes * load64(c + MSH_CL_CH) * 2) < 0) { return 0 - 7; }
+    return 0;
+}
+
+# Set this stream's Q8 gain (256 = unity, 0 = mute). Returns 0 / -7.
+fn msh_client_gain(c, gain): i64 {
+    var fd = load64(c + MSH_CL_FD);
+    var m = msh_msg_new();
+    msh_msg_set(m, MSH_GAIN, 1);
+    msh_msg_set_arg(m, 0, gain);
+    if (msh_send(fd, m) < 0) { return 0 - 7; }
+    return 0;
+}
+
+# Say BYE + close the connection. Returns 0.
+fn msh_client_close(c): i64 {
+    var fd = load64(c + MSH_CL_FD);
+    var m = msh_msg_new();
+    msh_msg_set(m, MSH_BYE, 0);
+    msh_send(fd, m);
+    sock_close(fd);
+    return 0;
+}

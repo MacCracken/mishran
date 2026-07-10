@@ -44,6 +44,8 @@ stdlib = [
     "bench",
     "thread",
     "fnptr",
+    "result",   # Result (Ok/Err/is_ok/result_unwrap) — net.cyr's return type
+    "net",      # cross-platform TCP sockets (tcp_socket/sock_*) — the server transport
 ]
 
 # vani — the output sink (audio device I/O: ALSA/OSS on Linux, snd #64-69 on

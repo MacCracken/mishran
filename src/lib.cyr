@@ -29,6 +29,11 @@ include "lib/bench.cyr"
 include "lib/thread.cyr"
 include "lib/fnptr.cyr"
 
+# result + net — the server transport (transport.cyr) speaks TCP over loopback
+# via net.cyr, whose Result return type comes from result.cyr.
+include "lib/result.cyr"
+include "lib/net.cyr"
+
 # ================================================================
 # vani — the audio output sink (core `audio_*` PCM shim).
 # VENDORED single file (vendor/vani-core.cyr) produced from vani's
@@ -54,3 +59,10 @@ include "src/error.cyr"
 include "src/stream.cyr"
 include "src/mix.cyr"
 include "src/route.cyr"
+
+# Server modules — "route through the mixer" over TCP loopback. proto.cyr (wire
+# messages) is dep-free; transport.cyr (TCP via net.cyr) uses it; server.cyr
+# (accept + dispatch + the app-facing client API) drives the router.
+include "src/proto.cyr"
+include "src/transport.cyr"
+include "src/server.cyr"

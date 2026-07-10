@@ -1,0 +1,75 @@
+# programs/serve_probe.cyr — end-to-end proof of the mishran SERVER over real
+# loopback TCP, single-process (no fork): stand up a server on a router, connect a
+# client, and drive the full handshake — HELLO → WELCOME, WRITE + PCM payload,
+# GAIN — verifying each lands in the router's registered stream. Exit 0 = PASS.
+
+include "src/lib.cyr"
+
+fn sp_fill(buf, n, val): i64 {
+    var i = 0;
+    while (i < n) { store16(buf + i * 2, val); i = i + 1; }
+    return 0;
+}
+fn sp_say(s): i64 { return syscall(1, 1, s, strlen(s)); }
+
+fn main(): i64 {
+    alloc_init();
+    var fails = 0;
+
+    var router = msh_router_new();
+    var server = msh_server_new(router);
+    if (server == 0) { sp_say("mishran serve_probe: SKIP (listen failed — no loopback?)\n"); return 0; }
+
+    var cfd = msh_connect();
+    if (cfd < 0) { sp_say("mishran serve_probe: SKIP (connect failed — no loopback?)\n"); return 0; }
+
+    # --- HELLO -> WELCOME ---
+    var h = msh_msg_new();
+    msh_msg_set(h, MSH_HELLO, 2); msh_msg_set_arg(h, 0, 48000); msh_msg_set_arg(h, 1, 2);
+    msh_send(cfd, h);
+    msh_server_poll(server);                 # accept + service HELLO -> stream + WELCOME
+    var w = msh_msg_new();
+    if (msh_read_msg(cfd, w) < 0) { fails = fails + 1; }
+    if (msh_msg_kind(w) != MSH_WELCOME) { fails = fails + 1; }
+    if (msh_msg_arg(w, 0) <= 0) { fails = fails + 1; }        # a real stream id
+    if (msh_router_count(router) != 1) { fails = fails + 1; } # registered on the router
+
+    # locate the registered stream (first slot)
+    var st = load64(msh_router_streams(router) + 0);
+    if (st == 0) { fails = fails + 1; }
+
+    # --- WRITE 4 stereo frames of constant 1234 ---
+    var pcm = alloc(4 * 2 * 2);
+    sp_fill(pcm, 8, 1234);                    # 4 frames * 2 channels = 8 samples
+    var wr = msh_msg_new();
+    msh_msg_set(wr, MSH_WRITE, 1); msh_msg_set_arg(wr, 0, 4);
+    msh_send(cfd, wr);
+    msh_write_all(cfd, pcm, 4 * 2 * 2);
+    msh_server_poll(server);                 # service WRITE -> stream_write into the ring
+    if (st != 0) {
+        if (msh_stream_avail(st) != 8) { fails = fails + 1; }  # 8 samples buffered
+        var rb = alloc(4 * 2 * 2);
+        if (msh_stream_read(st, rb, 4) != 4) { fails = fails + 1; }
+        if (msh_sext_s16(load16(rb + 0)) != 1234) { fails = fails + 1; }
+    }
+
+    # --- GAIN 128 (-6 dB) ---
+    var g = msh_msg_new();
+    msh_msg_set(g, MSH_GAIN, 1); msh_msg_set_arg(g, 0, 128);
+    msh_send(cfd, g);
+    msh_server_poll(server);
+    if (st != 0) { if (msh_stream_gain(st) != 128) { fails = fails + 1; } }
+
+    msh_server_close(server);
+    sock_close(cfd);
+
+    if (fails == 0) {
+        sp_say("mishran serve_probe: PASS (connect + hello/welcome + write PCM + gain over loopback)\n");
+        return 0;
+    }
+    sp_say("mishran serve_probe: FAIL\n");
+    return 1;
+}
+
+var rc = main();
+syscall(60, rc);
