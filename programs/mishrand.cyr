@@ -35,9 +35,17 @@ fn main(): i64 {
     md_say("mishrand: vani sink open — mixing app streams (Ctrl-C to stop)\n");
 
     # Real-time service loop: accept + drain clients, then pump the mix to the sink.
+    # Pump ONLY when a client is registered — a blocking audio_write on an idle
+    # (silent) sink would otherwise monopolise the CPU and starve a just-spawned
+    # client before it can even connect. Idle → just poll + yield.
     while (1 == 1) {
         msh_server_poll(server);       # accept new clients + read their PCM into rings
-        msh_router_pump(router);       # mix every stream -> vani sink (blocks = paces us)
+        if (msh_router_count(router) > 0) {
+            msh_router_pump(router);   # mix every stream -> vani sink (blocks = paces us)
+        }
+        #ifdef CYRIUS_TARGET_AGNOS
+        sys_sched_yield();             # let the jalwa client proc run
+        #endif
     }
 
     # Unreachable — a daemon runs until killed. Left for symmetry / a future

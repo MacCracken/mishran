@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agnos audio proof — the mixer plays on the sovereign kernel.** `programs/mishtone.cyr`
+  opens the vani sink via an `MshRouter`, registers two app streams at different Q8 gains
+  (440 Hz @ unity + 660 Hz @ -6 dB), and mixes them frame-by-frame down to the sink. Driven
+  on agnos by a `MISHRAN_AUDIO_SELFTEST` kernel hook (agnos `kernel/core/main.cyr` +
+  `scripts/build.sh`) and captured by `agnos scripts/mishran-audio-smoke.sh`: the mixed tone
+  reaches the HDA DAC — **RMS 3684, PEAK 6671** (thresholds 800/3000), `hda: stream running`.
+  Proves the whole path — fan-in + gain + `msh_router_pump` → vani `audio_*` → kernel
+  `snd_*` #64-69 — on-device, not just numerically.
+
 ## [0.4.0] - 2026-07-10 — the routing server
 
 Apps can now route audio THROUGH mishran instead of grabbing the single hardware writer:

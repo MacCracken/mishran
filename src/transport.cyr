@@ -62,8 +62,14 @@ fn msh_write_all(fd, buf, n): i64 {
     var sent = 0;
     while (sent < n) {
         var w = sys_write(fd, buf + sent, n - sent);
-        if (w <= 0) { return 0 - 7; }
-        sent = sent + w;
+        if (w < 0) { return 0 - 7; }                # hard error / peer closed
+        if (w == 0) {                               # would-block (send window full)
+            #ifdef CYRIUS_TARGET_AGNOS
+            sys_sleep_ms(1);                        # yield; let the server drain the ring (backpressure)
+            #endif
+        } else {
+            sent = sent + w;
+        }
     }
     return n;
 }

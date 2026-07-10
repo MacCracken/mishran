@@ -1,0 +1,86 @@
+# programs/mishtone.cyr — the mishran agnos audio proof (Gate: mix -> vani -> snd).
+#
+# Unlike vanitone (which drives vani's audio_* shim directly), this exercises the
+# whole MIXER: an MshRouter opens the vani sink, TWO app streams are registered
+# with different gains, each fed an integer square wave, and msh_router_pump mixes
+# them frame-by-frame down to the one sink. So a green wav proves fan-in + Q8 gain
+# + the router's sink write all work on the sovereign kernel, not just vani.
+#
+# Integer-only synthesis (phase-accumulated square, no %/f64) so it runs on agnos
+# ring-3 today. Stream A = 440 Hz @ unity, Stream B = 660 Hz @ -6 dB; ~1.5 s,
+# 48 kHz stereo S16, +/-6000 each (mixed peak ~9000, ~-11 dBFS). Volume-safe.
+#
+# Build:  cyrius build --agnos programs/mishtone.cyr build/mishtone-agnos
+#         cyrius build programs/mishtone.cyr build/mishtone            (host, degrades)
+
+include "src/lib.cyr"
+
+enum MtCfg {
+    MT_RATE  = 48000;
+    MT_AMP   = 6000;
+    MT_CH    = 2;
+    MT_CHUNK = 1024;    # frames per pump tick (== MSH_PUMP_FRAMES)
+    MT_TICKS = 72;      # ~1.5 s (72 * 1024 = 73728 frames at 48 kHz)
+}
+
+fn mt_puts(s): i64 { return sys_write(1, s, strlen(s)); }
+
+# Fill `frames` stereo S16 frames of a `freq` Hz square (amplitude `amp`),
+# continuing from `phase`; returns the new phase. Integer modulo (no %):
+# phase - (phase/period)*period.
+fn mt_square(buf, frames, freq, amp, phase): i64 {
+    var period = MT_RATE / freq;
+    var half = period / 2;
+    var i = 0;
+    var p = phase;
+    while (i < frames) {
+        var ph = p - ((p / period) * period);
+        var s = 0 - amp;
+        if (ph < half) { s = amp; }
+        var off = (i * MT_CH) * 2;
+        store16(buf + off, s);              # left
+        store16(buf + off + 2, s);          # right
+        p = p + 1;
+        i = i + 1;
+    }
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    mt_puts("mishtone: mixing 440 + 660 Hz through the router -> vani\n");
+
+    var router = msh_router_new();
+    if (msh_router_open(router, 0, 0) != MISHRAN_OK) {
+        mt_puts("mishtone: no audio device\n");
+        return 1;
+    }
+    mt_puts("mishtone: sink open\n");
+
+    var a = msh_stream_new(MT_RATE, MT_CH);
+    msh_router_add(router, a);
+    msh_stream_set_gain(a, 256);            # unity
+    var b = msh_stream_new(MT_RATE, MT_CH);
+    msh_router_add(router, b);
+    msh_stream_set_gain(b, 128);            # -6 dB
+
+    var abuf = alloc(MT_CHUNK * MT_CH * 2);
+    var bbuf = alloc(MT_CHUNK * MT_CH * 2);
+    var pa = 0;
+    var pb = 0;
+    var t = 0;
+    while (t < MT_TICKS) {
+        pa = mt_square(abuf, MT_CHUNK, 440, MT_AMP, pa);
+        pb = mt_square(bbuf, MT_CHUNK, 660, MT_AMP, pb);
+        msh_stream_write(a, abuf, MT_CHUNK);
+        msh_stream_write(b, bbuf, MT_CHUNK);
+        msh_router_pump(router);            # mix both streams -> vani sink -> snd
+        t = t + 1;
+    }
+    msh_router_close(router);
+    mt_puts("mishtone: done\n");
+    return 0;
+}
+
+var rc = main();
+syscall(60, rc);

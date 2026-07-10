@@ -12,8 +12,9 @@
 enum MshServerConf { MSH_MAX_CLIENTS = 16; }
 
 # MshServer: +0 listen fd, +8 router, +16 clients table ptr.
-# clients table: MSH_MAX_CLIENTS slots of [fd (+0), stream (+8)] = 16 bytes each
-# (fd == 0 = free slot; stream == 0 = accepted but not yet HELLO'd).
+# clients table: MSH_MAX_CLIENTS slots of [fd (+0), stream (+8), pending_frames
+# (+16)] = 24 bytes each. fd == 0 = free slot; stream == 0 = accepted but not yet
+# HELLO'd; pending_frames != 0 = a WRITE payload deferred for backpressure.
 
 # Create a server around `router`: bind + listen. Returns a *MshServer, or 0 if
 # the listener could not be opened.
@@ -21,11 +22,12 @@ fn msh_server_new(router): i64 {
     var lfd = msh_listen();
     if (lfd < 0) { return 0; }
     var s = alloc(24);
-    var tbl = alloc(MSH_MAX_CLIENTS * 16);
+    var tbl = alloc(MSH_MAX_CLIENTS * 24);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        store64(tbl + i * 16, 0);
-        store64(tbl + i * 16 + 8, 0);
+        store64(tbl + i * 24, 0);
+        store64(tbl + i * 24 + 8, 0);
+        store64(tbl + i * 24 + 16, 0);
         i = i + 1;
     }
     store64(s + 0, lfd);
@@ -43,9 +45,10 @@ fn msh_server_add_client(s, fd): i64 {
     var tbl = load64(s + 16);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        if (load64(tbl + i * 16) == 0) {
-            store64(tbl + i * 16, fd);
-            store64(tbl + i * 16 + 8, 0);
+        if (load64(tbl + i * 24) == 0) {
+            store64(tbl + i * 24, fd);
+            store64(tbl + i * 24 + 8, 0);
+            store64(tbl + i * 24 + 16, 0);
             return 0;
         }
         i = i + 1;
@@ -62,6 +65,7 @@ fn msh_server_drop(s, slot): i64 {
     if (fd != 0) { sock_close(fd); }
     store64(slot + 0, 0);
     store64(slot + 8, 0);
+    store64(slot + 16, 0);
     return 0;
 }
 
@@ -70,6 +74,23 @@ fn msh_server_drop(s, slot): i64 {
 # set the stream volume; BYE / EOF → drop. Returns 0.
 fn msh_server_service(s, slot): i64 {
     var fd = load64(slot + 0);
+    var stream = load64(slot + 8);
+
+    # A WRITE payload deferred last tick because the ring was full. Retry it FIRST,
+    # and only once the ring has room — the latched nframes gives its exact length
+    # so framing never desyncs. Still full → return, leaving the bytes in the
+    # socket (TCP backs up → the client's write blocks = real-time pacing).
+    var pending = load64(slot + 16);
+    if (pending != 0) {
+        if (msh_stream_free(stream) < pending * msh_stream_channels(stream)) { return 0; }
+        var pn = pending * msh_stream_channels(stream) * 2;
+        var pbuf = alloc(pn);
+        if (msh_read_exact(fd, pbuf, pn) < 0) { msh_server_drop(s, slot); return 0; }
+        msh_stream_write(stream, pbuf, pending);
+        store64(slot + 16, 0);
+        return 0;
+    }
+
     var m = msh_msg_new();
     var r = msh_try_read_msg(fd, m);
     if (r == 0) { return 0; }                        # nothing pending
@@ -85,13 +106,19 @@ fn msh_server_service(s, slot): i64 {
         msh_send(fd, w);
         return 0;
     }
-    var stream = load64(slot + 8);
     if (kind == MSH_WRITE) {
         if (stream == 0) { return 0; }               # WRITE before HELLO — ignore
         var nframes = msh_msg_arg(m, 0);
-        var nbytes = nframes * msh_stream_channels(stream) * 2;
-        var pcm = alloc(nbytes);
-        if (msh_read_exact(fd, pcm, nbytes) < 0) { msh_server_drop(s, slot); return 0; }
+        var wsamp = nframes * msh_stream_channels(stream);
+        # Backpressure: if the ring can't hold this chunk, LATCH nframes and leave
+        # the payload in the socket (TCP backs up → the client's write blocks). A
+        # chunk larger than the whole ring can never fit — read it lossily rather
+        # than deadlock forever (clients are expected to keep chunks small).
+        if (wsamp <= msh_stream_cap(stream) - 1) {
+            if (msh_stream_free(stream) < wsamp) { store64(slot + 16, nframes); return 0; }
+        }
+        var pcm = alloc(wsamp * 2);
+        if (msh_read_exact(fd, pcm, wsamp * 2) < 0) { msh_server_drop(s, slot); return 0; }
         msh_stream_write(stream, pcm, nframes);
         return 0;
     }
@@ -114,7 +141,7 @@ fn msh_server_poll(s): i64 {
     var tbl = load64(s + 16);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        if (load64(tbl + i * 16) != 0) { msh_server_service(s, tbl + i * 16); }
+        if (load64(tbl + i * 24) != 0) { msh_server_service(s, tbl + i * 24); }
         i = i + 1;
     }
     return 0;
@@ -125,7 +152,7 @@ fn msh_server_close(s): i64 {
     var tbl = load64(s + 16);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        if (load64(tbl + i * 16) != 0) { msh_server_drop(s, tbl + i * 16); }
+        if (load64(tbl + i * 24) != 0) { msh_server_drop(s, tbl + i * 24); }
         i = i + 1;
     }
     sock_close(load64(s + 0));

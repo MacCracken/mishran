@@ -46,9 +46,12 @@ fn msh_stream_new(rate, ch): i64 {
     store64(s + 8, MSH_FMT_S16);
     store64(s + 16, rate);
     store64(s + 24, ch);
-    # Default ring: 4096 frames * channels samples, 2 bytes each (S16).
-    var cap = 4096 * ch;
-    if (cap == 0) { cap = 4096; }
+    # Default ring: 16384 frames * channels samples, 2 bytes each (S16). Sized so
+    # a client's per-write chunk (<= MSH_PUMP_FRAMES = 1024) always has headroom
+    # once the pump has drained a tick — the server's backpressure latch depends
+    # on the ring being strictly larger than a single write.
+    var cap = 16384 * ch;
+    if (cap == 0) { cap = 16384; }
     var ring = alloc(cap * 2);
     if (ring == 0) { return 0; }
     store64(s + 32, ring);
@@ -83,6 +86,15 @@ fn msh_stream_avail(s): i64 {
     var d = head - tail;
     if (d < 0) { d = d + cap; }
     return d;
+}
+
+# Free sample slots the ring can still accept (cap - 1 - avail; one slot stays
+# empty to tell full from empty). Measured in SAMPLES (frames * channels). Used
+# by the server's pending-write backpressure latch (msh_server_service).
+fn msh_stream_free(s): i64 {
+    var free = load64(s + 40) - 1 - msh_stream_avail(s);
+    if (free < 0) { free = 0; }
+    return free;
 }
 
 # Write `frames` interleaved frames from `buf` (S16 samples) into the ring.
