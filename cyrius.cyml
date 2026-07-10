@@ -18,14 +18,20 @@ output = "build/mishran-smoke"
 # `[lib]` feeds `cyrius distlib` — module order matters: stdlib first
 # (declared in src/lib.cyr), then domain modules in dependency order.
 # error.cyr is dep-free; stream.cyr uses it; mix.cyr uses stream; route.cyr
-# owns the single sink and drives mix. Don't reorder without re-running
-# `cyrius distlib` and verifying the concatenated bundle still compiles clean.
+# owns the single sink and drives mix; then the server band — proto.cyr (wire
+# messages, dep-free), transport.cyr (TCP via net.cyr), server.cyr (accept +
+# dispatch + the app client). Consumers of the dist must supply `net` + `result`
+# in their own [deps].stdlib (transport.cyr's socket + Result deps). Don't reorder
+# without re-running `cyrius distlib` and verifying the bundle compiles clean.
 [lib]
 modules = [
     "src/error.cyr",
     "src/stream.cyr",
     "src/mix.cyr",
     "src/route.cyr",
+    "src/proto.cyr",
+    "src/transport.cyr",
+    "src/server.cyr",
 ]
 
 [deps]

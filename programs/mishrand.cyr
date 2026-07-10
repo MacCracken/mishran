@@ -1,0 +1,49 @@
+# programs/mishrand.cyr — the mishran mixing DAEMON (the runnable server).
+#
+# Opens the single vani sink, listens for app clients on loopback:7701, and runs
+# the real-time loop: service each client (drain its PCM into its stream ring) +
+# pump the mixed block to the sink. `audio_write` inside the pump blocks until the
+# device can take more, so it paces the loop to real time (no manual timer). This
+# is what a desktop runs so that many apps — a player, a game, notifications —
+# share the ONE hardware writer, each with its own level and a master level.
+#
+# The serving half is proven by serve_probe (over real loopback), the pump half by
+# pump_probe (real hardware); mishrand composes them. With no audio device (a
+# headless box) it degrades cleanly — reports and exits 2 rather than busy-spin.
+
+include "src/lib.cyr"
+
+fn md_say(s): i64 { return syscall(1, 1, s, strlen(s)); }
+
+fn main(): i64 {
+    alloc_init();
+
+    var router = msh_router_new();
+    var server = msh_server_new(router);
+    if (server == 0) {
+        md_say("mishrand: FATAL — cannot bind loopback:7701 (already running?)\n");
+        return 1;
+    }
+    md_say("mishrand: listening on loopback:7701\n");
+
+    if (msh_router_open(router, 0, 0) != MISHRAN_OK) {
+        md_say("mishrand: no audio device — a vani sink is required to run; exiting\n");
+        msh_server_close(server);
+        msh_router_close(router);
+        return 2;
+    }
+    md_say("mishrand: vani sink open — mixing app streams (Ctrl-C to stop)\n");
+
+    # Real-time service loop: accept + drain clients, then pump the mix to the sink.
+    while (1 == 1) {
+        msh_server_poll(server);       # accept new clients + read their PCM into rings
+        msh_router_pump(router);       # mix every stream -> vani sink (blocks = paces us)
+    }
+
+    # Unreachable — a daemon runs until killed. Left for symmetry / a future
+    # signal-driven shutdown (msh_server_close + msh_router_close).
+    return 0;
+}
+
+var rc = main();
+syscall(60, rc);

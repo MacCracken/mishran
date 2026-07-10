@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-10 — the routing server
+
+Apps can now route audio THROUGH mishran instead of grabbing the single hardware writer:
+a TCP-loopback server + the app client library + a runnable daemon.
+
 ### Added
 
+- **`mishrand` — the runnable mixing daemon** (`programs/mishrand.cyr`). Opens the vani sink,
+  listens on loopback:7701, and runs the real-time loop: `msh_server_poll` (accept + drain each
+  client's PCM into its ring) + `msh_router_pump` (mix every stream → the sink; `audio_write`
+  paces the loop to real time). Composes the two proven halves — serve_probe (serving) and
+  pump_probe (pumping). No audio device → a clean degrade (reports + exits 2, no busy-spin).
+  Builds `--agnos`.
 - **Routing server + app client — apps route THROUGH the mixer.** mishran gains a TCP-loopback
   server (port 7701) so many apps share the one vani writer instead of each grabbing it — the
   reason the mixer exists. New modules: **`proto.cyr`** (wire messages — `HELLO`/`WELCOME`/
