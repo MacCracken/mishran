@@ -106,7 +106,7 @@ enum MshFormat {
 }
 
 # ----------------------------------------------------------------
-# MshStream struct layout (56 bytes):
+# MshStream struct layout (72 bytes):
 #   +0:  id           — stream id (assigned by the router)
 #   +8:  format       — MshFormat tag
 #   +16: sample_rate  — frames per second (e.g. 48000)
@@ -115,6 +115,7 @@ enum MshFormat {
 #   +40: cap          — ring capacity in SAMPLES
 #   +48: head         — write cursor (samples, mod cap)
 #   +56: tail         — read cursor  (samples, mod cap)
+#   +64: gain         — per-stream volume, Q8 fixed-point (256 = unity, 0 = mute)
 # ----------------------------------------------------------------
 
 # Bytes-per-sample for a format. Returns 0 for an unknown tag.
@@ -127,7 +128,7 @@ fn msh_format_bytes(fmt): i64 {
 # Allocate a new S16 stream with a ring sized for `ring_frames` frames.
 # Returns a MshStream ptr, or 0 on allocation failure.
 fn msh_stream_new(rate, ch): i64 {
-    var s = alloc(64);
+    var s = alloc(72);
     if (s == 0) { return 0; }
     store64(s + 0, 0);              # id — router assigns on add
     store64(s + 8, MSH_FMT_S16);
@@ -142,6 +143,7 @@ fn msh_stream_new(rate, ch): i64 {
     store64(s + 40, cap);
     store64(s + 48, 0);            # head
     store64(s + 56, 0);            # tail
+    store64(s + 64, 256);          # gain — Q8 unity (256 = 1.0)
     return s;
 }
 
@@ -155,6 +157,11 @@ fn msh_stream_ring(s): i64        { return load64(s + 32); }
 fn msh_stream_cap(s): i64         { return load64(s + 40); }
 fn msh_stream_head(s): i64        { return load64(s + 48); }
 fn msh_stream_tail(s): i64        { return load64(s + 56); }
+
+# Per-stream volume, Q8 fixed-point: 256 = unity (0 dB), 128 = half (-6 dB),
+# 512 = 2x (+6 dB, may clip), 0 = mute. Applied by msh_mix during fan-in.
+fn msh_stream_gain(s): i64        { return load64(s + 64); }
+fn msh_stream_set_gain(s, g): i64 { store64(s + 64, g); return 0; }
 
 # Samples currently readable in the ring (head - tail, mod cap).
 fn msh_stream_avail(s): i64 {
@@ -226,8 +233,9 @@ fn msh_stream_read(s, out, frames): i64 {
 # writer" fan-in actually happens numerically.
 #
 # msh_mix sums the S16 samples of `n` streams frame-by-frame into `out`
-# with a hard clamp to the S16 range so a loud overlap doesn't wrap. This
-# is a REAL (if simple) mixer body — no gain, no dither, no soft-knee yet.
+# with a hard clamp to the S16 range so a loud overlap doesn't wrap, each
+# stream scaled by its per-stream Q8 gain first. A REAL (if simple) mixer
+# body — per-stream gain now; no dither, no soft-knee yet.
 
 # S16 sample bounds. Cyrius enum members must be plain numbers (no unary
 # minus), so the minimum is expressed as `0 - 32768` inside the clamp.
@@ -258,7 +266,7 @@ fn msh_sext_s16(u): i64 {
 # each stream's frames via msh_stream_read (missing frames read as silence),
 # sums sample-by-sample, clamps, and writes to `out`.
 # Returns MISHRAN_OK.
-# TODO(v0.2): per-stream gain, rate reconciliation via msh_resample, F32 path.
+# TODO(v0.2): rate reconciliation via msh_resample, F32 path.
 fn msh_mix(streams, n, out, frames): i64 {
     # Determine channel count from the first stream (default stereo).
     var ch = 2;
@@ -284,17 +292,33 @@ fn msh_mix(streams, n, out, frames): i64 {
     while (si < n) {
         var s = load64(streams + si * 8);
         if (s != 0) {
+            var g = msh_stream_gain(s);              # Q8 per-stream volume (256 = unity)
             var got = msh_stream_read(s, scratch, frames);
             var got_samples = got * ch;
             var k = 0;
             while (k < got_samples) {
                 var acc = msh_sext_s16(load16(out + k * 2));
-                acc = acc + msh_sext_s16(load16(scratch + k * 2));
+                acc = acc + (msh_sext_s16(load16(scratch + k * 2)) * g) / 256;
                 store16(out + k * 2, msh_clamp_s16(acc));
                 k = k + 1;
             }
         }
         si = si + 1;
+    }
+    return MISHRAN_OK;
+}
+
+# Scale `count` interleaved S16 samples in `buf` by a Q8 gain (256 = unity,
+# 0 = mute) IN PLACE, clamping each result to the S16 range. Drives the
+# router's master output level (msh_router_pump); gain == 256 is a no-op fast
+# path. Pure + unit-testable without a hardware sink.
+fn msh_apply_gain(buf, count, gain): i64 {
+    if (gain == 256) { return MISHRAN_OK; }
+    var i = 0;
+    while (i < count) {
+        var v = (msh_sext_s16(load16(buf + i * 2)) * gain) / 256;
+        store16(buf + i * 2, msh_clamp_s16(v));
+        i = i + 1;
     }
     return MISHRAN_OK;
 }
@@ -336,19 +360,20 @@ enum MshRouterCap {
 }
 
 # ----------------------------------------------------------------
-# MshRouter struct layout (48 bytes):
+# MshRouter struct layout (56 bytes):
 #   +0:  sink       — vani sink handle (0 = no sink open yet)
 #   +8:  streams    — ptr to array of MSH_MAX_STREAMS stream ptrs (8 each)
 #   +16: count      — number of registered streams
 #   +24: next_id    — monotonic id allocator
 #   +32: channels   — sink channel count (default 2, stereo)
 #   +40: rate       — sink sample rate (default 48000)
+#   +48: master     — master output volume, Q8 (256 = unity, 0 = mute)
 # ----------------------------------------------------------------
 
 # Allocate a router with an empty stream table and no sink.
 # Returns a MshRouter ptr, or 0 on allocation failure.
 fn msh_router_new(): i64 {
-    var r = alloc(48);
+    var r = alloc(56);
     if (r == 0) { return 0; }
     var tbl = alloc(MSH_MAX_STREAMS * 8);
     if (tbl == 0) { return 0; }
@@ -363,6 +388,7 @@ fn msh_router_new(): i64 {
     store64(r + 24, 1);          # next_id starts at 1
     store64(r + 32, 2);          # channels — stereo
     store64(r + 40, 48000);      # rate
+    store64(r + 48, 256);        # master output gain — Q8 unity
     return r;
 }
 
@@ -372,6 +398,11 @@ fn msh_router_streams(r): i64   { return load64(r + 8); }
 fn msh_router_count(r): i64     { return load64(r + 16); }
 fn msh_router_channels(r): i64  { return load64(r + 32); }
 fn msh_router_rate(r): i64      { return load64(r + 40); }
+
+# Master output volume, Q8 fixed-point (256 = unity, 128 = -6 dB, 0 = mute).
+# Applied to the mixed block in msh_router_pump just before the sink write.
+fn msh_router_gain(r): i64      { return load64(r + 48); }
+fn msh_router_set_gain(r, g): i64 { store64(r + 48, g); return 0; }
 
 # Open the vani hardware sink for this router. `card`/`device` select the ALSA
 # PCM endpoint (both ignored on agnos, where the sovereign snd stream is
@@ -449,6 +480,9 @@ fn msh_router_pump(r): i64 {
     var streams = load64(r + 8);
     var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES);
     if (rc != MISHRAN_OK) { return rc; }
+
+    # Apply the master output level to the mixed block (Q8; no-op at unity).
+    msh_apply_gain(mixbuf, total, load64(r + 48));
 
     # Push the mixed block to the vani sink. audio_write returns the frame
     # count accepted, or negative on error; -EPIPE (0 - 32) is an ALSA

@@ -18,7 +18,7 @@ enum MshFormat {
 }
 
 # ----------------------------------------------------------------
-# MshStream struct layout (56 bytes):
+# MshStream struct layout (72 bytes):
 #   +0:  id           — stream id (assigned by the router)
 #   +8:  format       — MshFormat tag
 #   +16: sample_rate  — frames per second (e.g. 48000)
@@ -27,6 +27,7 @@ enum MshFormat {
 #   +40: cap          — ring capacity in SAMPLES
 #   +48: head         — write cursor (samples, mod cap)
 #   +56: tail         — read cursor  (samples, mod cap)
+#   +64: gain         — per-stream volume, Q8 fixed-point (256 = unity, 0 = mute)
 # ----------------------------------------------------------------
 
 # Bytes-per-sample for a format. Returns 0 for an unknown tag.
@@ -39,7 +40,7 @@ fn msh_format_bytes(fmt): i64 {
 # Allocate a new S16 stream with a ring sized for `ring_frames` frames.
 # Returns a MshStream ptr, or 0 on allocation failure.
 fn msh_stream_new(rate, ch): i64 {
-    var s = alloc(64);
+    var s = alloc(72);
     if (s == 0) { return 0; }
     store64(s + 0, 0);              # id — router assigns on add
     store64(s + 8, MSH_FMT_S16);
@@ -54,6 +55,7 @@ fn msh_stream_new(rate, ch): i64 {
     store64(s + 40, cap);
     store64(s + 48, 0);            # head
     store64(s + 56, 0);            # tail
+    store64(s + 64, 256);          # gain — Q8 unity (256 = 1.0)
     return s;
 }
 
@@ -67,6 +69,11 @@ fn msh_stream_ring(s): i64        { return load64(s + 32); }
 fn msh_stream_cap(s): i64         { return load64(s + 40); }
 fn msh_stream_head(s): i64        { return load64(s + 48); }
 fn msh_stream_tail(s): i64        { return load64(s + 56); }
+
+# Per-stream volume, Q8 fixed-point: 256 = unity (0 dB), 128 = half (-6 dB),
+# 512 = 2x (+6 dB, may clip), 0 = mute. Applied by msh_mix during fan-in.
+fn msh_stream_gain(s): i64        { return load64(s + 64); }
+fn msh_stream_set_gain(s, g): i64 { store64(s + 64, g); return 0; }
 
 # Samples currently readable in the ring (head - tail, mod cap).
 fn msh_stream_avail(s): i64 {

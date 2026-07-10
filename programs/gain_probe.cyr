@@ -1,0 +1,73 @@
+# programs/gain_probe.cyr — numeric proof of mishran's "control outputs" gain.
+#
+# The gain path is pure integer math (Q8 fixed-point over S16), identical on
+# every target — so a deterministic host run fully validates it (no hardware).
+# Checks: per-stream gain in msh_mix, master gain via msh_apply_gain, the S16
+# clamp on a boosted overlap, and mute (gain 0). Exit 0 = PASS, 1 = FAIL.
+
+include "src/lib.cyr"
+
+# Fill n interleaved S16 samples of buf with the constant val.
+fn gp_fill(buf, n, val): i64 {
+    var i = 0;
+    while (i < n) { store16(buf + i * 2, val); i = i + 1; }
+    return 0;
+}
+
+fn gp_sample(buf, i): i64 { return msh_sext_s16(load16(buf + i * 2)); }
+
+fn main(): i64 {
+    alloc_init();
+    var fails = 0;
+
+    # --- per-stream gain: A@unity(1000) + B@half(1000->500) = 1500 ---
+    var a = msh_stream_new(48000, 1);
+    var b = msh_stream_new(48000, 1);
+    var src = alloc(4 * 2); gp_fill(src, 4, 1000);
+    msh_stream_write(a, src, 4);
+    msh_stream_write(b, src, 4);
+    msh_stream_set_gain(a, 256);          # unity
+    msh_stream_set_gain(b, 128);          # -6 dB (half)
+    var streams = alloc(2 * 8);
+    store64(streams + 0, a); store64(streams + 8, b);
+    var out = alloc(4 * 2);
+    msh_mix(streams, 2, out, 4);
+    var i = 0;
+    while (i < 4) { if (gp_sample(out, i) != 1500) { fails = fails + 1; } i = i + 1; }
+
+    # --- master gain: msh_apply_gain(1500, 128) -> 750 ---
+    msh_apply_gain(out, 4, 128);
+    i = 0;
+    while (i < 4) { if (gp_sample(out, i) != 750) { fails = fails + 1; } i = i + 1; }
+
+    # --- clamp: 30000 @ 2x -> 60000, clamped to S16 max 32767 ---
+    var c = msh_stream_new(48000, 1);
+    var loud = alloc(2 * 2); gp_fill(loud, 2, 30000);
+    msh_stream_write(c, loud, 2);
+    msh_stream_set_gain(c, 512);          # +6 dB (2x)
+    var st1 = alloc(1 * 8); store64(st1 + 0, c);
+    var out1 = alloc(2 * 2);
+    msh_mix(st1, 1, out1, 2);
+    if (gp_sample(out1, 0) != 32767) { fails = fails + 1; }
+
+    # --- mute: gain 0 -> silence ---
+    var d = msh_stream_new(48000, 1);
+    msh_stream_write(d, src, 4);
+    msh_stream_set_gain(d, 0);
+    var st2 = alloc(1 * 8); store64(st2 + 0, d);
+    var out2 = alloc(4 * 2);
+    msh_mix(st2, 1, out2, 4);
+    if (gp_sample(out2, 0) != 0) { fails = fails + 1; }
+
+    if (fails == 0) {
+        var ok = "mishran gain_probe: PASS (per-stream gain + master gain + clamp + mute)\n";
+        syscall(1, 1, ok, strlen(ok));
+        return 0;
+    }
+    var bad = "mishran gain_probe: FAIL\n";
+    syscall(1, 1, bad, strlen(bad));
+    return 1;
+}
+
+var rc = main();
+syscall(60, rc);

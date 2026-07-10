@@ -21,19 +21,20 @@ enum MshRouterCap {
 }
 
 # ----------------------------------------------------------------
-# MshRouter struct layout (48 bytes):
+# MshRouter struct layout (56 bytes):
 #   +0:  sink       — vani sink handle (0 = no sink open yet)
 #   +8:  streams    — ptr to array of MSH_MAX_STREAMS stream ptrs (8 each)
 #   +16: count      — number of registered streams
 #   +24: next_id    — monotonic id allocator
 #   +32: channels   — sink channel count (default 2, stereo)
 #   +40: rate       — sink sample rate (default 48000)
+#   +48: master     — master output volume, Q8 (256 = unity, 0 = mute)
 # ----------------------------------------------------------------
 
 # Allocate a router with an empty stream table and no sink.
 # Returns a MshRouter ptr, or 0 on allocation failure.
 fn msh_router_new(): i64 {
-    var r = alloc(48);
+    var r = alloc(56);
     if (r == 0) { return 0; }
     var tbl = alloc(MSH_MAX_STREAMS * 8);
     if (tbl == 0) { return 0; }
@@ -48,6 +49,7 @@ fn msh_router_new(): i64 {
     store64(r + 24, 1);          # next_id starts at 1
     store64(r + 32, 2);          # channels — stereo
     store64(r + 40, 48000);      # rate
+    store64(r + 48, 256);        # master output gain — Q8 unity
     return r;
 }
 
@@ -57,6 +59,11 @@ fn msh_router_streams(r): i64   { return load64(r + 8); }
 fn msh_router_count(r): i64     { return load64(r + 16); }
 fn msh_router_channels(r): i64  { return load64(r + 32); }
 fn msh_router_rate(r): i64      { return load64(r + 40); }
+
+# Master output volume, Q8 fixed-point (256 = unity, 128 = -6 dB, 0 = mute).
+# Applied to the mixed block in msh_router_pump just before the sink write.
+fn msh_router_gain(r): i64      { return load64(r + 48); }
+fn msh_router_set_gain(r, g): i64 { store64(r + 48, g); return 0; }
 
 # Open the vani hardware sink for this router. `card`/`device` select the ALSA
 # PCM endpoint (both ignored on agnos, where the sovereign snd stream is
@@ -134,6 +141,9 @@ fn msh_router_pump(r): i64 {
     var streams = load64(r + 8);
     var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES);
     if (rc != MISHRAN_OK) { return rc; }
+
+    # Apply the master output level to the mixed block (Q8; no-op at unity).
+    msh_apply_gain(mixbuf, total, load64(r + 48));
 
     # Push the mixed block to the vani sink. audio_write returns the frame
     # count accepted, or negative on error; -EPIPE (0 - 32) is an ALSA

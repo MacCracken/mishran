@@ -4,8 +4,9 @@
 # writer" fan-in actually happens numerically.
 #
 # msh_mix sums the S16 samples of `n` streams frame-by-frame into `out`
-# with a hard clamp to the S16 range so a loud overlap doesn't wrap. This
-# is a REAL (if simple) mixer body — no gain, no dither, no soft-knee yet.
+# with a hard clamp to the S16 range so a loud overlap doesn't wrap, each
+# stream scaled by its per-stream Q8 gain first. A REAL (if simple) mixer
+# body — per-stream gain now; no dither, no soft-knee yet.
 
 # S16 sample bounds. Cyrius enum members must be plain numbers (no unary
 # minus), so the minimum is expressed as `0 - 32768` inside the clamp.
@@ -36,7 +37,7 @@ fn msh_sext_s16(u): i64 {
 # each stream's frames via msh_stream_read (missing frames read as silence),
 # sums sample-by-sample, clamps, and writes to `out`.
 # Returns MISHRAN_OK.
-# TODO(v0.2): per-stream gain, rate reconciliation via msh_resample, F32 path.
+# TODO(v0.2): rate reconciliation via msh_resample, F32 path.
 fn msh_mix(streams, n, out, frames): i64 {
     # Determine channel count from the first stream (default stereo).
     var ch = 2;
@@ -62,17 +63,33 @@ fn msh_mix(streams, n, out, frames): i64 {
     while (si < n) {
         var s = load64(streams + si * 8);
         if (s != 0) {
+            var g = msh_stream_gain(s);              # Q8 per-stream volume (256 = unity)
             var got = msh_stream_read(s, scratch, frames);
             var got_samples = got * ch;
             var k = 0;
             while (k < got_samples) {
                 var acc = msh_sext_s16(load16(out + k * 2));
-                acc = acc + msh_sext_s16(load16(scratch + k * 2));
+                acc = acc + (msh_sext_s16(load16(scratch + k * 2)) * g) / 256;
                 store16(out + k * 2, msh_clamp_s16(acc));
                 k = k + 1;
             }
         }
         si = si + 1;
+    }
+    return MISHRAN_OK;
+}
+
+# Scale `count` interleaved S16 samples in `buf` by a Q8 gain (256 = unity,
+# 0 = mute) IN PLACE, clamping each result to the S16 range. Drives the
+# router's master output level (msh_router_pump); gain == 256 is a no-op fast
+# path. Pure + unit-testable without a hardware sink.
+fn msh_apply_gain(buf, count, gain): i64 {
+    if (gain == 256) { return MISHRAN_OK; }
+    var i = 0;
+    while (i < count) {
+        var v = (msh_sext_s16(load16(buf + i * 2)) * gain) / 256;
+        store16(buf + i * 2, msh_clamp_s16(v));
+        i = i + 1;
     }
     return MISHRAN_OK;
 }

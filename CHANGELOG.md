@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-stream + master gain — "control outputs."** Each `MshStream` now carries a
+  Q8 fixed-point gain (`+64`; 256 = unity, 128 = -6 dB, 512 = +6 dB, 0 = mute), and
+  `msh_mix` scales every stream by its gain during fan-in. The `MshRouter` carries a
+  **master** output gain (`+48`) applied to the mixed block in `msh_router_pump` via the
+  reusable, sink-free `msh_apply_gain`. `msh_stream_set_gain` / `msh_router_set_gain` are
+  the control surface — so a desktop can set each app's level and a master level before
+  the single hardware write. Integer-only (matches the S16 mixing ethos; no float).
+  Verified by `programs/gain_probe.cyr`: per-stream gain, master gain, the S16 clamp on a
+  boosted overlap, and mute are all numerically exact; builds `--agnos` (the gain math is
+  platform-identical, so the host proof carries).
 - **vani output sink wired — first real device write.** The `MshRouter`'s
   single-writer sink slot now opens and drives a real `vani` PCM device:
   `msh_router_open(r, card, device)` (`audio_open_playback` → `audio_set_params`
