@@ -42,8 +42,8 @@ fn main(): i64 {
         msh_server_poll(server);       # accept new clients + read their PCM into rings
         if (msh_router_count(router) > 0) {
             msh_router_pump_nb(router); # mix every stream -> vani sink (NON-blocking: emits a
-                                        # block when the DAC has room, else returns — so a
-                                        # blocking write never starves a concurrent client proc)
+            # block when the DAC has room, else returns — so a
+            # blocking write never starves a concurrent client proc)
         }
         #ifdef CYRIUS_TARGET_AGNOS
         sys_sched_yield();             # let the client proc(s) run (cooperative, DAC-paced)
