@@ -42,9 +42,10 @@ include "lib/net.cyr"
 # `[deps].stdlib` (yukti/patra/chrono) even though the core shim only needs
 # the base stdlib set already declared above. Vendoring compiles just the shim
 # against mishran's own stdlib list. Mirrors cyrius-doom / -polyomino / -bb.
-# (Provenance: vani 1.0.0.) route.cyr calls audio_open_playback /
-# audio_set_params / audio_write / audio_prepare / audio_drain / audio_close,
-# so this must precede src/route.cyr.
+# (Provenance: vani 1.1.0.) route.cyr calls audio_open_playback /
+# audio_set_params / audio_write / audio_prepare / audio_drain / audio_close, plus
+# audio_write_nb / audio_avail (the non-blocking sink API new in vani 1.1.0, used by
+# the cooperative msh_router_pump_nb) — so this must precede src/route.cyr.
 # ================================================================
 include "vendor/vani-core.cyr"
 

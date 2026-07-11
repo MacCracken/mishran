@@ -7,8 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-10 — two-proc audio on agnos (cooperative yield)
+
+Two concurrent processes can now share the one hardware writer through the mixer on
+agnos — an app streams to the daemon over the loopback wire while the daemon mixes to
+vani, with no deadlock. The fix is pure userland (no kernel-logic change); see the
+agnos planning note `docs/development/planning/blocking-syscall-concurrency.md`.
+
 ### Added
 
+- **Two concurrent procs play through the mixer on agnos — the cooperative-yield fix.**
+  The two-proc audio path (a separate app streaming to the mixer daemon over the
+  loopback wire) deadlocked on agnos: a blocking `audio_write` in the pump — and the
+  client's blocking `sleep_ms` send-backoff — held the CPU with preemption disabled,
+  and the kernel *cannot* preempt a blocking syscall (the shared per-CPU syscall kstack,
+  the serial-kstack invariant), so whichever proc blocked starved the other. Fixed
+  entirely in userland (no kernel-logic change) with the proven cooperative-yield
+  pattern (`sched_yield` #44, the 1.53.9 setu-present cure):
+  - `src/route.cyr` — new **`msh_router_pump_nb`** for multi-proc daemons: on agnos,
+    emit a block **only when the DAC ring has room for a whole block** (`audio_avail`
+    #69), write it NONBLOCK (`audio_write_nb` #66), else return without mixing so the
+    daemon stays responsive to its clients; never a blocking, pump-hogging write (Linux
+    delegates to the blocking pump). The original `msh_router_pump` stays **blocking** —
+    single-proc feed loops (mishtone) rely on it to pace to real time. `mishrand` +
+    `mishduplex` now pump via `_nb`; mishtone (single-proc, RMS 3700) is unchanged.
+  - `src/transport.cyr` — the agnos send/recv would-block backoffs (`msh_write_all`,
+    `msh_read_blk`) now `sys_sched_yield` instead of `sys_sleep_ms`, so a stalled proc
+    donates its slice to the peer that must drain it instead of spin-sleeping preempt-off.
+- **Server-side flow control — WRITE-payload backpressure latch.** `src/server.cyr`
+  `msh_server_service` now defers a WRITE payload when the target stream ring can't hold
+  it: it latches the frame count (`pending_frames` in the client slot) and leaves the
+  bytes in the socket so TCP backs up and the client's write blocks — real-time pacing
+  without dropping audio or desyncing the frame stream (the latched count gives the
+  payload's exact length when the ring drains). A chunk larger than the whole ring is
+  read lossily rather than deadlocking. Pairs with the client's `sched_yield` send
+  backoff so the two procs stay in lockstep.
+- **Two-proc audio proof — `programs/mishduplex.cyr` (server) + `programs/mishclient.cyr`
+  (client).** The mixer server binds loopback:7701 + opens the vani sink, then
+  `spawn_path`'s the client (the desktop server-first ordering — bind before the client
+  connects); the client streams a square-wave tone over the real TCP wire; the server
+  mixes it to vani. Driven on agnos by a `MISHRAN_DUPLEX_SELFTEST` kernel hook (agnos
+  `kernel/core/main.cyr`, **post-`sched_active`** so two procs actually run concurrently)
+  and captured by `agnos scripts/mishran-duplex-audio-smoke.sh`: **RMS 2116, PEAK 4448**
+  (thresholds 800/3000), `hda: stream running`. PCM is chunked below the 2 KB agnos TCP
+  loopback window (256 frames/write) + `sched_yield`-paced so `sock_send` #48 fits the
+  recv buffer instead of blocking preempt-held — a wire constraint, not a mixer one (see
+  Notes). Proves: two concurrent ring-3 procs, real loopback handshake, cooperative
+  mix-to-DAC, no deadlock, no starvation.
 - **Agnos audio proof — the mixer plays on the sovereign kernel.** `programs/mishtone.cyr`
   opens the vani sink via an `MshRouter`, registers two app streams at different Q8 gains
   (440 Hz @ unity + 660 Hz @ -6 dB), and mixes them frame-by-frame down to the sink. Driven

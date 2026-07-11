@@ -65,7 +65,10 @@ fn msh_write_all(fd, buf, n): i64 {
         if (w < 0) { return 0 - 7; }                # hard error / peer closed
         if (w == 0) {                               # would-block (send window full)
             #ifdef CYRIUS_TARGET_AGNOS
-            sys_sleep_ms(1);                        # yield; let the server drain the ring (backpressure)
+            sys_sched_yield();                      # DONATE the slice so the server drains the ring.
+            # Must be sched_yield #44, NOT sleep_ms: sleep_ms holds preempt off, so a
+            # client whose send window is full would spin-sleep without ever letting the
+            # server run to drain it — a deadlock (agnos-blocking-syscall-yield-fix).
             #endif
         } else {
             sent = sent + w;
@@ -90,12 +93,18 @@ fn msh_send(fd, m): i64 {
 fn msh_read_blk(fd, buf, cap): i64 {
     var tries = 0;
     #ifdef CYRIUS_TARGET_AGNOS
-    while (tries <= 5000) {                          # agnos: recv is non-blocking; yield + retry
+    # agnos: recv is non-blocking; DONATE the slice (sched_yield #44) so the peer runs
+    # to produce the bytes, then retry. Not sleep_ms — that holds preempt off and would
+    # keep the peer from ever running (agnos-blocking-syscall-yield-fix). The cap is a
+    # generous safety net against a silent-but-alive peer (a dead peer returns r<0 and
+    # breaks immediately); each yield is a full peer-slice, so this is far longer than
+    # the old 5000*2ms wall clock without falsely timing out a cooperative exchange.
+    while (tries <= 2000000) {
         var r = sys_read(fd, buf, cap);
         if (r < 0) { return 0 - 6; }               # -1 = EOF / error
         if (r > 0) { return r; }                   # got bytes
         tries = tries + 1;                          # r == 0 → would-block
-        sys_sleep_ms(2);
+        sys_sched_yield();
     }
     return 0 - 6;
     #endif

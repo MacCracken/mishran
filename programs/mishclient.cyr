@@ -1,0 +1,115 @@
+# programs/mishclient.cyr — the mishran two-proc audio CLIENT (secondary proc).
+#
+# Spawned by /bin/mishduplex (the server primary) AFTER it has bound loopback:7701
+# + opened the vani sink — the proven desktop ordering (aethersafha binds, then
+# spawn_path's puka). Because the server is already listening, a blocking
+# sock_connect #47 completes in-kernel (the loopback handshake lands in the
+# listener's accept queue without the server proc running); a client-spawns-server
+# ordering can't, since the client's preempt-held connect starves the unbound server.
+#
+# Connects (msh_client_connect), then streams a synthesized square-wave tone
+# (msh_client_write). Each write may yield mid-send when its window is full, so the
+# server runs to drain + pump — the cooperative dance (sched_yield #44) that replaces
+# the old preempt-off sleep_ms block that deadlocked the two procs
+# (agnos-blocking-syscall-yield-fix). Exits when the tone is done.
+#
+# Build:  cyrius build --agnos programs/mishclient.cyr build/mishclient-agnos
+
+include "src/lib.cyr"
+
+enum McCfg {
+    MC_RATE  = 48000;
+    MC_AMP   = 6000;    # single stream ~-14 dBFS, square RMS ~= amp (strong, volume-safe)
+    MC_CH    = 2;
+    # 256 frames/chunk = 1024 payload bytes — BELOW the 2 KB agnos TCP loopback recv
+    # window, so each WRITE's sock_send #48 fits the peer's recv buffer and completes
+    # in-kernel instead of BLOCKING preempt-held for ACKs (which would starve the
+    # server; sock_send is a preempt-held blocking syscall — agnos-blocking-syscall-
+    # yield-fix). Paced with a sched_yield after each write so the server drains between
+    # sends and the window never backs up. The mixer still pumps 1024-frame blocks; the
+    # server's stream ring buffers these small chunks up to a pump block.
+    MC_CHUNK = 256;
+    MC_TICKS = 288;     # ~1.5 s (288 * 256 = 73728 frames at 48 kHz)
+}
+
+fn mc_puts(s): i64 { return sys_write(1, s, strlen(s)); }
+
+# print a non-negative integer to stdout (diagnostic).
+fn _mc_sayn(n): i64 {
+    if (n == 0) { return sys_write(1, "0", 1); }
+    var tmp = alloc(24);
+    var i = 0;
+    var v = n;
+    while (v > 0) { store8(tmp + i, 48 + (v - (v / 10) * 10)); i = i + 1; v = v / 10; }
+    var out = alloc(24);
+    var j = 0;
+    while (j < i) { store8(out + j, load8(tmp + (i - 1 - j))); j = j + 1; }
+    return sys_write(1, out, i);
+}
+
+# Fill `frames` stereo S16 frames of a `freq` Hz square (amplitude `amp`), continuing
+# from `phase`; returns the new phase. Integer modulo (no %): p - (p/period)*period.
+fn mc_square(buf, frames, freq, amp, phase): i64 {
+    var period = MC_RATE / freq;
+    var half = period / 2;
+    var i = 0;
+    var p = phase;
+    while (i < frames) {
+        var ph = p - ((p / period) * period);
+        var s = 0 - amp;
+        if (ph < half) { s = amp; }
+        var off = (i * MC_CH) * 2;
+        store16(buf + off, s);              # left
+        store16(buf + off + 2, s);          # right
+        p = p + 1;
+        i = i + 1;
+    }
+    return p;
+}
+
+fn main(): i64 {
+    alloc_init();
+    mc_puts("mishclient: connecting to mishduplex server (loopback:7701)\n");
+
+    # The server binds BEFORE spawning us, so connect should succeed immediately; a
+    # few yield-retries cover any startup skew (yield, NOT sleep_ms — a preempt-off
+    # sleep here would starve the server we need to run).
+    var c = 0;
+    var waiting = 1;
+    var tries = 0;
+    while (waiting == 1) {
+        c = msh_client_connect(MC_RATE, MC_CH);
+        if (c != 0) { waiting = 0; }
+        else {
+            tries = tries + 1;
+            if (tries > 100000) { waiting = 0; }   # give up (server never came up)
+            else { sys_sched_yield(); }
+        }
+    }
+    if (c == 0) { mc_puts("mishclient: connect FAILED\n"); return 2; }
+    mc_puts("mishclient: connected + registered stream\n");
+    msh_client_gain(c, 256);                       # unity — the server's mixer applies gain
+    mc_puts("mishclient: gain set, streaming\n");
+
+    # Stream a 440 Hz square in MC_CHUNK-frame blocks. Each msh_client_write may yield
+    # mid-send when its window is full, letting the server drain + pump — cooperative.
+    var buf = alloc(MC_CHUNK * MC_CH * 2);
+    var phase = 0;
+    var t = 0;
+    while (t < MC_TICKS) {
+        phase = mc_square(buf, MC_CHUNK, 440, MC_AMP, phase);
+        if (msh_client_write(c, buf, MC_CHUNK) < 0) { mc_puts("mishclient: stream write FAILED\n"); t = MC_TICKS; }
+        else {
+            if ((t - (t / 48) * 48) == 0) { mc_puts("mishclient: block "); _mc_sayn(t); mc_puts("\n"); }
+            sys_sched_yield();     # pace: let the server drain this chunk before the next send
+            t = t + 1;
+        }
+    }
+
+    msh_client_close(c);
+    mc_puts("mishclient: streamed tone -> done\n");
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

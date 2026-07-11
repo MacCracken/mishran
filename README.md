@@ -2,7 +2,7 @@
 
 **मिश्रण — mixing / mixture**
 
-Version: 0.1.0
+Version: 0.4.1
 
 Sovereign software **audio mixer + routing daemon** for AGNOS, written in
 pure Cyrius. mishran is the multi-stream fan-in layer the agnostic audio
@@ -24,25 +24,29 @@ mishran talks to the device. That is the whole point of the mixer.
 
 ## Scope
 
-**v0.1.0 = scaffold.** This is a buildable skeleton, not a finished mixer.
-It compiles green (the `programs/smoke.cyr` banner links the full include
-chain) and lays down the real type surface:
+**v0.4.x = a working mixer + routing server.** mishran fans many per-app
+S16 streams into one mixed writer to a real `vani` sink, with per-stream
+and master gain, linear resampling, and a TCP-loopback routing server so
+separate app processes can share the one hardware writer. Proven on agnos:
+a single-proc mixed tone (`mishtone`) and a **two-proc** client→loopback→
+mixer→vani→HDA tone (`mishduplex` + `mishclient`), both non-silent.
 
 - `src/error.cyr` — `MishranErr` codes + `mishran_err_*` helpers.
 - `src/stream.cyr` — `MshStream`: id, `MshFormat` (S16/F32), sample rate,
-  channels, and a single-producer/single-consumer sample ring buffer
-  (`msh_stream_new` / `msh_stream_write` / `msh_stream_read`, working S16).
-- `src/mix.cyr` — `msh_mix`: a **real** (simple) integer sum-and-clamp
-  fan-in over N S16 streams into one output frame buffer; `msh_resample`
-  is a stub.
+  channels, per-stream Q8 gain, and a single-producer/single-consumer
+  sample ring (`msh_stream_new` / `msh_stream_write` / `msh_stream_read`).
+- `src/mix.cyr` — `msh_mix`: integer sum-and-clamp fan-in over N S16
+  streams with per-stream gain + sink-rate reconcile; `msh_resample` is a
+  real linear resampler.
 - `src/route.cyr` — `MshRouter`: the **single-writer** owner of the one
-  vani sink plus the registered stream table (`msh_router_new` /
-  `msh_router_add` / `msh_router_remove` / `msh_router_pump`). The pump
-  loop stops short of the device write until the sink is wired.
+  vani sink plus the registered stream table. `msh_router_pump` (blocking,
+  single-proc paced) and `msh_router_pump_nb` (cooperative, non-blocking —
+  for a multi-proc daemon on agnos) mix + write to the device.
+- `src/proto.cyr` / `transport.cyr` / `server.cyr` — the TCP routing
+  server + `msh_client_*` app API + a WRITE-payload backpressure latch.
 
-Deferred to later cycles: per-stream gain, proper resampling, the F32
-path, and opening the real `vani` sink in `msh_router_pump` (see
-**Consumers** / the deferred cross-dep note below).
+Deferred: the F32 mix path (S16 is the working path) and a router-owned
+thread for the pump loop.
 
 ## Place in the stack
 

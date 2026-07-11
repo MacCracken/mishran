@@ -1,0 +1,93 @@
+# programs/mishduplex.cyr — the mishran TWO-PROC audio proof PRIMARY (server side).
+#
+# Mirrors the proven desktop topology (the aethersafha compositor binds :7700, then
+# spawn_path's puka): the SERVER binds FIRST, THEN spawns the client, so the client's
+# connect lands on an already-listening socket. A loopback connect completes in-kernel
+# once the listener is bound; the reverse (client spawns server, then connects) can't,
+# because the client's blocking sock_connect #47 holds preemption off and starves the
+# unbound server (agnos-blocking-syscall-yield-fix).
+#
+# Binds loopback:7701 + opens the vani sink (the REAL msh_server / msh_router
+# machinery — same as the mishrand daemon), spawn_path's /bin/mishclient, then runs
+# the service+pump loop: msh_server_poll (accept + drain client PCM into rings) +
+# msh_router_pump (the cooperative, non-blocking mix -> vani write). The client
+# streams a tone; we mix it down to the sovereign audio output. Two concurrent ring-3
+# procs interleaving over TCP — the case that DEADLOCKED before the sched_yield #44
+# fix. A non-silent captured wav = both procs got CPU, no deadlock, no starvation.
+#
+# Build:  cyrius build --agnos programs/mishduplex.cyr build/mishduplex-agnos
+
+include "src/lib.cyr"
+
+fn dx_say(s): i64 { return sys_write(1, s, strlen(s)); }
+
+# print a non-negative integer to stdout (diagnostic).
+fn dx_sayn(n): i64 {
+    if (n == 0) { return sys_write(1, "0", 1); }
+    var tmp = alloc(24);
+    var i = 0;
+    var v = n;
+    while (v > 0) { store8(tmp + i, 48 + (v - (v / 10) * 10)); i = i + 1; v = v / 10; }
+    var out = alloc(24);
+    var j = 0;
+    while (j < i) { store8(out + j, load8(tmp + (i - 1 - j))); j = j + 1; }
+    return sys_write(1, out, i);
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    var router = msh_router_new();
+    var server = msh_server_new(router);
+    if (server == 0) { dx_say("mishduplex: FATAL — cannot bind loopback:7701\n"); return 1; }
+    dx_say("mishduplex: listening on loopback:7701\n");
+
+    if (msh_router_open(router, 0, 0) != MISHRAN_OK) {
+        dx_say("mishduplex: no audio device — a vani sink is required; exiting\n");
+        msh_server_close(server);
+        msh_router_close(router);
+        return 2;
+    }
+    dx_say("mishduplex: vani sink open\n");
+
+    # Server bound + sink open — NOW spawn the client (it connects back to us).
+    var path = "/bin/mishclient";
+    var pid = sys_spawn_path(path, strlen(path));
+    if (pid < 0) { dx_say("mishduplex: spawn mishclient FAILED\n"); return 3; }
+    dx_say("mishduplex: spawned mishclient\n");
+
+    # Service + pump loop. Accept + drain the client, mix to vani. sched_yield each
+    # tick so the client proc gets CPU to stream. Exit once the client has connected
+    # and then finished (BYE -> stream count back to 0); a large safety cap bounds the
+    # run if the client never shows (so the smoke terminates cleanly, vs the forever
+    # mishrand daemon).
+    var seen = 0;
+    var ticks = 0;
+    var pumps = 0;
+    while (ticks < 400000) {
+        msh_server_poll(server);
+        var cnt = msh_router_count(router);
+        if (cnt > 0) {
+            seen = 1;
+            if (msh_router_pump_nb(router) == MISHRAN_OK) { pumps = pumps + 1; }
+        }
+        else { if (seen == 1) { ticks = 400000; } }   # client done -> break
+        # heartbeat: every 40000 ticks show progress (diagnostic).
+        if ((ticks - (ticks / 40000) * 40000) == 0) {
+            dx_say("mishduplex: tick "); dx_sayn(ticks);
+            dx_say(" cnt "); dx_sayn(cnt);
+            dx_say(" pumps "); dx_sayn(pumps); dx_say("\n");
+        }
+        sys_sched_yield();
+        ticks = ticks + 1;
+    }
+    dx_say("mishduplex: loop end pumps "); dx_sayn(pumps); dx_say("\n");
+
+    msh_server_close(server);
+    msh_router_close(router);
+    dx_say("mishduplex: done\n");
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();
