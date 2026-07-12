@@ -5,7 +5,7 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — PCM over shared memory (lifts the 2 KB TCP-window ceiling)
+## [0.5.0] - 2026-07-11 — PCM over shared memory + the serving-loop leak fix
 
 The two-proc audio path now moves the PCM payload **off the TCP wire and onto a
 shared-memory buffer** — the audio counterpart of setu's framebuffer present. Only a
@@ -16,6 +16,11 @@ the window. Validated on agnos with 1024-frame (4096 B) blocks — larger than t
 TCP window — reaching the DAC (`mishran-duplex-audio-smoke.sh`, RMS 2269 / PEAK 4448, no
 deadlock). Pure userland; no kernel change (the `sys_shm_*` syscalls #71-74 already ship,
 the same ones setu's present uses).
+
+This cut also **closes the serving-loop heap leak** the shm bite's adversarial-verify
+pass surfaced (the `### Known` item that was pending): the routing server no longer
+allocates in its per-poll / per-block hot path, so a genuinely long-running mixer daemon
+(`mishrand` — e.g. jalwa streaming a full song) no longer OOMs mid-stream. See **Fixed**.
 
 ### Added
 
@@ -53,14 +58,36 @@ the same ones setu's present uses).
 - The legacy inline `MSH_WRITE` path is **unchanged** (`serve_probe` still PASS) — the
   server still handles it; only the client API (`msh_client_write`) moved to shm.
 
-### Known
+### Fixed
 
-- **Long-running daemon heap growth (pre-existing, not from this change).** The serving
-  loop allocs per-poll message structs + per-block PCM scratch from the bump allocator
-  with no reclamation; a forever-running mixer daemon (`mishrand`) would eventually OOM.
-  Masked by bounded smokes (which exit in ~1.5 s). Tracked for a focused
-  reusable-buffer refactor; surfaced by a 2-lens adversarial-verify pass whose flow-
-  control review otherwise found the shm path sound.
+- **Unbounded serving-loop heap leak (the pending `### Known` item, now closed).** The
+  bump allocator has no per-object free, and nothing in the serving path called
+  `alloc_reset`, so **every poll of an active slot leaked** a message struct
+  (`msh_server_service`) + a 48 B wire read buffer (`msh_try_read_msg`, allocated even
+  when nothing was pending) and **every consumed block leaked** a PCM copy-out (~4 KB /
+  1024-frame stereo block) + the ACK's two structs (`msh_srv_ack` → `msh_msg_new` +
+  `msh_send`). A forever-running `mishrand` daemon would OOM mid-stream; the bounded
+  smokes (which exit in ~1.5 s) masked it. Fixed with **server-owned reusable buffers** on
+  `MshServer` (`alloc(24) → alloc(56)`): one reused `MshMsg` for the poll/decode/reply
+  path, one reused wire read buffer (`msh_try_read_msg` now takes it as a parameter), and
+  a **grow-on-demand PCM copy-out scratch** (`msh_server_pcm` — alloc'd once, reused across
+  blocks). `msh_srv_ack` is now **alloc-free**, encoding the fixed 3-word ACK straight into
+  a caller-supplied buffer (the server's read buffer, free by the time an ACK is sent). A
+  host leak probe measuring `alloc_used()` across **20 000 blocks**: server heap growth
+  **0 bytes in steady state** (a one-time 1 KB scratch warmup), versus ~1.2 KB/block
+  (≈ 24 MB) before. Deliberately **no per-tick `alloc_reset`**: `HELLO` allocates persistent
+  stream/ring state (`msh_stream_new`) inside the loop, which a blanket reset would
+  reclaim out from under live streams. Re-validated end-to-end on agnos
+  (`mishran-duplex-audio-smoke.sh`, incl. a ~10 s long-run variant, sustained tone to the
+  DAC, no deadlock/OOM).
+- **Orphaned client shm buffer on abnormal client drop.** A client that vanished without a
+  `BYE` (crash) left its one out-of-band shm buffer unreclaimed for the daemon's lifetime.
+  Low-severity on Linux (a stray tmpfs file), but a real hazard on agnos, whose kernel has
+  only `SHM_MAX = 16` shm slots — 16 crashed clients would exhaust them and refuse all new
+  connections. The server now tracks each client's last-announced buffer (`last_buf`; the
+  per-client slot grew 32 → 40 B) and frees it on an **abnormal** drop; a clean `BYE` zeros
+  it first so the client's own `msh_client_close` free stays authoritative (avoids a
+  double-free that could hit a since-reused slot id).
 
 ## [0.4.1] - 2026-07-10 — two-proc audio on agnos (cooperative yield)
 

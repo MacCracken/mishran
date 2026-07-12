@@ -150,9 +150,10 @@ fn msh_read_msg(fd, m): i64 {
 # NON-BLOCKING read of ONE message into `m` for the server poll. Returns 1 with a
 # decoded message, 0 when nothing is pending (would-block), or -1 on EOF/error.
 # Once a header byte arrives the rest is read blocking (bounded), so a message is
-# never left half-consumed.
-fn msh_try_read_msg(fd, m): i64 {
-    var buf = alloc(MSH_MSG_SZ);
+# never left half-consumed. `buf` is a caller-supplied wire scratch buffer of >=
+# MSH_MSG_SZ bytes (the server owns one reusable buffer) — this is polled on EVERY
+# slot EVERY tick, so allocating it here would leak unboundedly on a long daemon.
+fn msh_try_read_msg(fd, m, buf): i64 {
     var r = sys_read(fd, buf, 16);
     #ifdef CYRIUS_TARGET_AGNOS
     if (r == 0) { return 0; }                      # would-block → nothing pending
