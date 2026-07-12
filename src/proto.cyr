@@ -1,20 +1,30 @@
 # @public — mishran the wire protocol.
 # proto.cyr — the message format spoken between an app (client) and the mishran
 # router (server) over TCP loopback (see transport.cyr). Modeled on setu's
-# codec/proto: a message is 8-byte words — kind, argc, then argc args. The
-# MSH_WRITE opcode is followed on the wire by a raw S16 PCM payload
-# (nframes * channels * 2 bytes) that is NOT part of the message struct.
+# codec/proto: a message is 8-byte words — kind, argc, then argc args.
+#
+# Two ways to deliver PCM:
+#   MSH_WRITE     — the args are followed on the wire by a raw S16 PCM payload
+#                   (nframes*channels*2 bytes) NOT part of the message struct.
+#                   Simple, but the payload must stay under the ~2 KB agnos
+#                   loopback recv window, so per-write chunks are small (256 fr).
+#   MSH_WRITE_SHM — the PCM lives out-of-band in a shared buffer (shm.cyr); the
+#                   message carries only [nframes, buf_id]. Lifts the window
+#                   ceiling; the server ACKs (MSH_ACK) once it has copied the
+#                   block out, so the client can safely reuse the buffer.
 #
 # proto.cyr is dep-free (no stdlib beyond load64/store64/alloc) so it sits at the
 # head of the server modules in the include chain.
 
 enum MshOp {
-    MSH_HELLO   = 1;   # C->S: args [rate, channels] — register a stream
-    MSH_WELCOME = 2;   # S->C: args [stream_id]      — assigned id
-    MSH_WRITE   = 3;   # C->S: args [nframes] + PCM payload (nframes*ch*2 bytes)
-    MSH_GAIN    = 4;   # C->S: args [gain_q8]         — set this stream's volume
-    MSH_BYE     = 5;   # C->S: no args               — disconnect
-    MSH_ERR     = 6;   # S->C: args [code]           — protocol error
+    MSH_HELLO     = 1;   # C->S: args [rate, channels] — register a stream
+    MSH_WELCOME   = 2;   # S->C: args [stream_id]      — assigned id
+    MSH_WRITE     = 3;   # C->S: args [nframes] + inline PCM payload (nframes*ch*2 bytes)
+    MSH_GAIN      = 4;   # C->S: args [gain_q8]        — set this stream's volume
+    MSH_BYE       = 5;   # C->S: no args               — disconnect
+    MSH_ERR       = 6;   # S->C: args [code]           — protocol error
+    MSH_WRITE_SHM = 7;   # C->S: args [nframes, buf_id] — PCM out-of-band in shm buffer buf_id
+    MSH_ACK       = 8;   # S->C: args [buf_id]         — buffer consumed; client may reuse it
 }
 
 # A message: kind (+0), argc (+8), up to MSH_MAX_ARGS args (+16..). 48 bytes.

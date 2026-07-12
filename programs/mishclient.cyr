@@ -21,15 +21,16 @@ enum McCfg {
     MC_RATE  = 48000;
     MC_AMP   = 6000;    # single stream ~-14 dBFS, square RMS ~= amp (strong, volume-safe)
     MC_CH    = 2;
-    # 256 frames/chunk = 1024 payload bytes — BELOW the 2 KB agnos TCP loopback recv
-    # window, so each WRITE's sock_send #48 fits the peer's recv buffer and completes
-    # in-kernel instead of BLOCKING preempt-held for ACKs (which would starve the
-    # server; sock_send is a preempt-held blocking syscall — agnos-blocking-syscall-
-    # yield-fix). Paced with a sched_yield after each write so the server drains between
-    # sends and the window never backs up. The mixer still pumps 1024-frame blocks; the
-    # server's stream ring buffers these small chunks up to a pump block.
-    MC_CHUNK = 256;
-    MC_TICKS = 288;     # ~1.5 s (288 * 256 = 73728 frames at 48 kHz)
+    # 1024 frames/chunk = 4096 payload bytes — DELIBERATELY ABOVE the ~2 KB agnos TCP
+    # loopback recv window. That was impossible on the old inline-WRITE path (a
+    # sock_send #48 that big would block preempt-held waiting for the peer to drain,
+    # starving the server); msh_client_write now moves the PCM over a shared buffer
+    # (MSH_WRITE_SHM) and only the tiny control message rides TCP, so the block size
+    # is bounded by the shm buffer, not the window. Each write cooperatively waits for
+    # the server's MSH_ACK before reusing the buffer (real-time pacing); the extra
+    # sched_yield below just donates a slice so the daemon pumps between blocks.
+    MC_CHUNK = 1024;
+    MC_TICKS = 72;      # ~1.5 s (72 * 1024 = 73728 frames at 48 kHz)
 }
 
 fn mc_puts(s): i64 { return sys_write(1, s, strlen(s)); }

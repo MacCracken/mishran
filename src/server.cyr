@@ -9,12 +9,19 @@
 # Depends on route.cyr (the router), stream.cyr (the per-client stream),
 # transport.cyr (TCP), and proto.cyr (the wire messages).
 
-enum MshServerConf { MSH_MAX_CLIENTS = 16; }
+enum MshServerConf {
+    MSH_MAX_CLIENTS = 16;
+    MSH_SLOT_SZ     = 32;   # per-client slot size (see the table layout below)
+}
 
 # MshServer: +0 listen fd, +8 router, +16 clients table ptr.
 # clients table: MSH_MAX_CLIENTS slots of [fd (+0), stream (+8), pending_frames
-# (+16)] = 24 bytes each. fd == 0 = free slot; stream == 0 = accepted but not yet
-# HELLO'd; pending_frames != 0 = a WRITE payload deferred for backpressure.
+# (+16), pending_buf (+24)] = MSH_SLOT_SZ (32) bytes each. fd == 0 = free slot;
+# stream == 0 = accepted but not yet HELLO'd; pending_frames != 0 = a WRITE
+# payload deferred for backpressure. pending_buf: if the deferred payload came in
+# over shm (MSH_WRITE_SHM), pending_buf != 0 holds the shm buffer id (the bytes
+# sit safely in the client-owned buffer, not the socket); if 0, the deferred
+# payload is legacy inline PCM still in the socket (MSH_WRITE).
 
 # Create a server around `router`: bind + listen. Returns a *MshServer, or 0 if
 # the listener could not be opened.
@@ -22,12 +29,13 @@ fn msh_server_new(router): i64 {
     var lfd = msh_listen();
     if (lfd < 0) { return 0; }
     var s = alloc(24);
-    var tbl = alloc(MSH_MAX_CLIENTS * 24);
+    var tbl = alloc(MSH_MAX_CLIENTS * MSH_SLOT_SZ);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        store64(tbl + i * 24, 0);
-        store64(tbl + i * 24 + 8, 0);
-        store64(tbl + i * 24 + 16, 0);
+        store64(tbl + i * MSH_SLOT_SZ, 0);
+        store64(tbl + i * MSH_SLOT_SZ + 8, 0);
+        store64(tbl + i * MSH_SLOT_SZ + 16, 0);
+        store64(tbl + i * MSH_SLOT_SZ + 24, 0);
         i = i + 1;
     }
     store64(s + 0, lfd);
@@ -45,10 +53,11 @@ fn msh_server_add_client(s, fd): i64 {
     var tbl = load64(s + 16);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        if (load64(tbl + i * 24) == 0) {
-            store64(tbl + i * 24, fd);
-            store64(tbl + i * 24 + 8, 0);
-            store64(tbl + i * 24 + 16, 0);
+        if (load64(tbl + i * MSH_SLOT_SZ) == 0) {
+            store64(tbl + i * MSH_SLOT_SZ, fd);
+            store64(tbl + i * MSH_SLOT_SZ + 8, 0);
+            store64(tbl + i * MSH_SLOT_SZ + 16, 0);
+            store64(tbl + i * MSH_SLOT_SZ + 24, 0);
             return 0;
         }
         i = i + 1;
@@ -66,7 +75,18 @@ fn msh_server_drop(s, slot): i64 {
     store64(slot + 0, 0);
     store64(slot + 8, 0);
     store64(slot + 16, 0);
+    store64(slot + 24, 0);
     return 0;
+}
+
+# Send an MSH_ACK(buf_id) to the client on `fd`: the server has copied that shm
+# buffer's PCM into the stream ring, so the client may safely reuse it. Tiny (a
+# 24-byte control frame) — always fits the loopback window, never backpressures.
+fn msh_srv_ack(fd, buf_id): i64 {
+    var m = msh_msg_new();
+    msh_msg_set(m, MSH_ACK, 1);
+    msh_msg_set_arg(m, 0, buf_id);
+    return msh_send(fd, m);
 }
 
 # Service one client slot: read + dispatch one pending message (non-blocking).
@@ -82,8 +102,23 @@ fn msh_server_service(s, slot): i64 {
     # socket (TCP backs up → the client's write blocks = real-time pacing).
     var pending = load64(slot + 16);
     if (pending != 0) {
-        if (msh_stream_free(stream) < pending * msh_stream_channels(stream)) { return 0; }
-        var pn = pending * msh_stream_channels(stream) * 2;
+        var pch = msh_stream_channels(stream);
+        if (msh_stream_free(stream) < pending * pch) { return 0; }
+        var pn = pending * pch * 2;
+        var pshm = load64(slot + 24);
+        if (pshm != 0) {
+            # shm-deferred (MSH_WRITE_SHM): the PCM sits in the client-owned buffer,
+            # not the socket. Copy it out, feed the ring, then ACK — releasing the
+            # client's single-buffer credit so it may write the next block.
+            var ppcm = alloc(pn);
+            if (msh_shm_read(pshm, ppcm, pn) < 0) { msh_server_drop(s, slot); return 0; }
+            msh_stream_write(stream, ppcm, pending);
+            store64(slot + 16, 0);
+            store64(slot + 24, 0);
+            msh_srv_ack(fd, pshm);
+            return 0;
+        }
+        # legacy inline-deferred (MSH_WRITE): the bytes are still in the socket.
         var pbuf = alloc(pn);
         if (msh_read_exact(fd, pbuf, pn) < 0) { msh_server_drop(s, slot); return 0; }
         msh_stream_write(stream, pbuf, pending);
@@ -122,6 +157,33 @@ fn msh_server_service(s, slot): i64 {
         msh_stream_write(stream, pcm, nframes);
         return 0;
     }
+    if (kind == MSH_WRITE_SHM) {
+        var shframes = msh_msg_arg(m, 0);
+        var shbuf    = msh_msg_arg(m, 1);
+        # WRITE before HELLO — no stream to feed; ACK anyway so the (misbehaving)
+        # client doesn't hang waiting to reclaim its buffer.
+        if (stream == 0) { msh_srv_ack(fd, shbuf); return 0; }
+        var shsamp = shframes * msh_stream_channels(stream);
+        # Backpressure: if the ring can't hold this block, LATCH it (frames + shm
+        # buf id) and DON'T ack — the PCM stays safe in the client-owned shm buffer,
+        # and the client, out of its single-buffer credit, stalls until we drain the
+        # ring and ack (real-time pacing without a socket-desync risk, since nothing
+        # was left half-read on the wire). A block larger than the whole ring can
+        # never fit — consume it lossily rather than deadlock forever (clients keep
+        # blocks <= MSH_SHM_BLOCK_FRAMES).
+        if (shsamp <= msh_stream_cap(stream) - 1) {
+            if (msh_stream_free(stream) < shsamp) {
+                store64(slot + 16, shframes);
+                store64(slot + 24, shbuf);
+                return 0;
+            }
+        }
+        var shpcm = alloc(shsamp * 2);
+        if (msh_shm_read(shbuf, shpcm, shsamp * 2) < 0) { msh_server_drop(s, slot); return 0; }
+        msh_stream_write(stream, shpcm, shframes);
+        msh_srv_ack(fd, shbuf);          # consumed -> release the client's buffer credit
+        return 0;
+    }
     if (kind == MSH_GAIN) {
         if (stream != 0) { msh_stream_set_gain(stream, msh_msg_arg(m, 0)); }
         return 0;
@@ -141,7 +203,7 @@ fn msh_server_poll(s): i64 {
     var tbl = load64(s + 16);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        if (load64(tbl + i * 24) != 0) { msh_server_service(s, tbl + i * 24); }
+        if (load64(tbl + i * MSH_SLOT_SZ) != 0) { msh_server_service(s, tbl + i * MSH_SLOT_SZ); }
         i = i + 1;
     }
     return 0;
@@ -152,7 +214,7 @@ fn msh_server_close(s): i64 {
     var tbl = load64(s + 16);
     var i = 0;
     while (i < MSH_MAX_CLIENTS) {
-        if (load64(tbl + i * 24) != 0) { msh_server_drop(s, tbl + i * 24); }
+        if (load64(tbl + i * MSH_SLOT_SZ) != 0) { msh_server_drop(s, tbl + i * MSH_SLOT_SZ); }
         i = i + 1;
     }
     sock_close(load64(s + 0));
@@ -164,11 +226,23 @@ fn msh_server_close(s): i64 {
 # =========================================================================
 
 enum MshClientOff {
-    MSH_CL_FD   = 0;
-    MSH_CL_ID   = 8;
-    MSH_CL_RATE = 16;
-    MSH_CL_CH   = 24;
-    MSH_CL_SZ   = 32;
+    MSH_CL_FD       = 0;
+    MSH_CL_ID       = 8;
+    MSH_CL_RATE     = 16;
+    MSH_CL_CH       = 24;
+    MSH_CL_BUF      = 32;   # the single out-of-band shm PCM buffer id
+    MSH_CL_INFLIGHT = 40;   # 1 = a block is in flight (buffer busy until ACK)
+    MSH_CL_SZ       = 48;
+}
+
+enum MshClientShm {
+    # Max frames handed off per shm block. A block is copied into the one client
+    # buffer, announced with MSH_WRITE_SHM, and reclaimed on MSH_ACK — so the block
+    # size only bounds latency + the buffer size (MSH_SHM_BLOCK_FRAMES*ch*2 bytes),
+    # NOT the TCP window (that was the old inline-WRITE 256-frame ceiling). 2048
+    # stereo frames = 8 KB — trivially under the agnos single-page shm cap, and 8x
+    # the old inline chunk.
+    MSH_SHM_BLOCK_FRAMES = 2048;
 }
 
 # Connect to the mishran server + register a stream at rate/channels: sends HELLO,
@@ -189,21 +263,62 @@ fn msh_client_connect(rate, ch): i64 {
     store64(c + MSH_CL_ID, msh_msg_arg(w, 0));
     store64(c + MSH_CL_RATE, rate);
     store64(c + MSH_CL_CH, ch);
+    # Reserve the single out-of-band PCM buffer (one MSH_SHM_BLOCK_FRAMES block).
+    # msh_client_write fills it, announces MSH_WRITE_SHM, and reuses it only after
+    # the server's MSH_ACK — the flow control + reuse guard in one.
+    var buf = msh_shm_create(MSH_SHM_BLOCK_FRAMES * ch * 2);
+    if (buf <= 0) { sock_close(fd); return 0; }
+    store64(c + MSH_CL_BUF, buf);
+    store64(c + MSH_CL_INFLIGHT, 0);
     return c;
 }
 
 fn msh_client_fd(c): i64 { return load64(c + MSH_CL_FD); }
 fn msh_client_id(c): i64 { return load64(c + MSH_CL_ID); }
 
-# Write `nframes` interleaved S16 frames from `pcm` to the client's stream.
-# Returns 0, or -7 on a send error.
-fn msh_client_write(c, pcm, nframes): i64 {
+# Block (cooperatively) until the server ACKs the in-flight buffer, clearing the
+# in-flight flag so the buffer may be reused. Loops reading control messages until
+# the ACK arrives (after WELCOME the server sends only MSH_ACK). On agnos each
+# read cooperatively yields (msh_read_msg) so the server runs to drain + ack — a
+# full server ring simply defers the ack, stalling the client in real-time pace.
+# Returns 0, or -6 on EOF / error.
+fn msh_client_wait_ack(c): i64 {
     var fd = load64(c + MSH_CL_FD);
-    var m = msh_msg_new();
-    msh_msg_set(m, MSH_WRITE, 1);
-    msh_msg_set_arg(m, 0, nframes);
-    if (msh_send(fd, m) < 0) { return 0 - 7; }
-    if (msh_write_all(fd, pcm, nframes * load64(c + MSH_CL_CH) * 2) < 0) { return 0 - 7; }
+    while (load64(c + MSH_CL_INFLIGHT) != 0) {
+        var m = msh_msg_new();
+        if (msh_read_msg(fd, m) < 0) { return 0 - 6; }
+        if (msh_msg_kind(m) == MSH_ACK) { store64(c + MSH_CL_INFLIGHT, 0); }
+    }
+    return 0;
+}
+
+# Write `nframes` interleaved S16 frames from `pcm` to the client's stream, over
+# shared memory (the PCM never touches the TCP wire — only the tiny MSH_WRITE_SHM
+# control message does). Splits into <= MSH_SHM_BLOCK_FRAMES blocks; each block
+# reuses the one client buffer, so it waits for the prior block's ACK before
+# overwriting (the server copies a block out BEFORE acking, so reuse-after-ack is
+# race-free, and a full ring defers the ack = automatic real-time pacing).
+# Returns 0, or -7 on a send / shm error.
+fn msh_client_write(c, pcm, nframes): i64 {
+    var fd  = load64(c + MSH_CL_FD);
+    var ch  = load64(c + MSH_CL_CH);
+    var buf = load64(c + MSH_CL_BUF);
+    var off = 0;                                   # frames already handed off
+    while (off < nframes) {
+        var chunk = nframes - off;
+        if (chunk > MSH_SHM_BLOCK_FRAMES) { chunk = MSH_SHM_BLOCK_FRAMES; }
+        if (load64(c + MSH_CL_INFLIGHT) != 0) {
+            if (msh_client_wait_ack(c) < 0) { return 0 - 7; }
+        }
+        if (msh_shm_write(buf, pcm + off * ch * 2, chunk * ch * 2) < 0) { return 0 - 7; }
+        var m = msh_msg_new();
+        msh_msg_set(m, MSH_WRITE_SHM, 2);
+        msh_msg_set_arg(m, 0, chunk);
+        msh_msg_set_arg(m, 1, buf);
+        if (msh_send(fd, m) < 0) { return 0 - 7; }
+        store64(c + MSH_CL_INFLIGHT, 1);
+        off = off + chunk;
+    }
     return 0;
 }
 
@@ -217,12 +332,16 @@ fn msh_client_gain(c, gain): i64 {
     return 0;
 }
 
-# Say BYE + close the connection. Returns 0.
+# Say BYE, free the out-of-band buffer, and close the connection. Returns 0. A
+# still-in-flight final block may be lost (the server drops the stream on BYE /
+# on a failed read of the freed buffer) — inconsequential at shutdown.
 fn msh_client_close(c): i64 {
     var fd = load64(c + MSH_CL_FD);
     var m = msh_msg_new();
     msh_msg_set(m, MSH_BYE, 0);
     msh_send(fd, m);
+    var buf = load64(c + MSH_CL_BUF);
+    if (buf > 0) { msh_shm_free(buf); }
     sock_close(fd);
     return 0;
 }

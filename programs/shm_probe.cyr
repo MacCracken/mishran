@@ -1,0 +1,185 @@
+# programs/shm_probe.cyr — Linux-first proof of the mishran SHARED-MEMORY PCM path
+# (MSH_WRITE_SHM + MSH_ACK), single-process (no fork). Three tests:
+#   A. the shm buffer primitive round-trips bytes (msh_shm_create/write/read/free).
+#   B. the real client write path (msh_client_write) hands a block off over shm; the
+#      server copies it into the stream ring and ACKs; a 2nd write exercises the
+#      client's wait-for-ACK reuse guard.
+#   C. backpressure: when the ring can't hold a block the server LATCHES it (pending
+#      frames + shm buf id, no ACK); draining the ring + re-polling runs the
+#      pending-retry (shm_read + ring write + ACK). Verified by slot inspection.
+# Exit 0 = PASS. Host-only (the agnos two-proc form is validated in QEMU by
+# scripts/mishran-duplex-audio-smoke.sh).
+
+include "src/lib.cyr"
+
+fn xp_say(s): i64 { return syscall(1, 1, s, strlen(s)); }
+fn xp_fill16(buf, n, val): i64 { var i = 0; while (i < n) { store16(buf + i * 2, val); i = i + 1; } return 0; }
+
+# --- Test A: shm primitive byte round-trip. Returns fail count. ---
+fn test_shm_roundtrip(): i64 {
+    var fails = 0;
+    var sz = 64;
+    var b = msh_shm_create(sz);
+    if (b <= 0) { return 1; }
+    var src = alloc(sz);
+    var i = 0;
+    while (i < sz) { store8(src + i, i + 1); i = i + 1; }
+    if (msh_shm_write(b, src, sz) < 0) { fails = fails + 1; }
+    var dst = alloc(sz);
+    if (msh_shm_read(b, dst, sz) < 0) { fails = fails + 1; }
+    var j = 0;
+    while (j < sz) { if (load8(dst + j) != load8(src + j)) { fails = fails + 1; j = sz; } j = j + 1; }
+    msh_shm_free(b);
+    return fails;
+}
+
+# --- Test B: client shm write -> server WRITE_SHM -> ring + ACK, with reuse. ---
+fn test_write_ack(): i64 {
+    var fails = 0;
+    var router = msh_router_new();
+    var server = msh_server_new(router);
+    if (server == 0) { xp_say("  B: SKIP (listen failed — no loopback?)\n"); return 0; }
+    var cfd = msh_connect();
+    if (cfd < 0) { xp_say("  B: SKIP (connect failed — no loopback?)\n"); msh_server_close(server); return 0; }
+
+    # Manual handshake — msh_client_connect would block on WELCOME single-process
+    # (nothing polls the server), so drive it explicitly like serve_probe.
+    var h = msh_msg_new();
+    msh_msg_set(h, MSH_HELLO, 2); msh_msg_set_arg(h, 0, 48000); msh_msg_set_arg(h, 1, 2);
+    msh_send(cfd, h);
+    msh_server_poll(server);
+    var w = msh_msg_new();
+    if (msh_read_msg(cfd, w) < 0) { fails = fails + 1; }
+    if (msh_msg_kind(w) != MSH_WELCOME) { fails = fails + 1; }
+    var sid = msh_msg_arg(w, 0);
+    if (msh_router_count(router) != 1) { fails = fails + 1; }
+    var st = load64(msh_router_streams(router) + 0);
+    if (st == 0) { fails = fails + 1; }
+
+    # Build a MshClient by hand around cfd (skips connect's blocking WELCOME read),
+    # then drive the REAL msh_client_write / wait_ack code over it.
+    var c = alloc(MSH_CL_SZ);
+    store64(c + MSH_CL_FD, cfd);
+    store64(c + MSH_CL_ID, sid);
+    store64(c + MSH_CL_RATE, 48000);
+    store64(c + MSH_CL_CH, 2);
+    store64(c + MSH_CL_INFLIGHT, 0);
+    var cbuf = msh_shm_create(MSH_SHM_BLOCK_FRAMES * 2 * 2);
+    if (cbuf <= 0) { fails = fails + 1; }
+    store64(c + MSH_CL_BUF, cbuf);
+
+    # Block 1: 4 stereo frames of 1234 over shm.
+    var pcm1 = alloc(4 * 2 * 2);
+    xp_fill16(pcm1, 8, 1234);
+    if (msh_client_write(c, pcm1, 4) < 0) { fails = fails + 1; }
+    msh_server_poll(server);                       # WRITE_SHM -> shm_read + ring write + ACK
+    if (msh_stream_avail(st) != 8) { fails = fails + 1; }
+    var rb = alloc(4 * 2 * 2);
+    if (msh_stream_read(st, rb, 4) != 4) { fails = fails + 1; }
+    if (msh_sext_s16(load16(rb + 0)) != 1234) { fails = fails + 1; }
+
+    # Block 2: exercises wait_ack — inflight is set, so the write first reads the
+    # ACK from the poll above (reuse guard) before overwriting the buffer.
+    var pcm2 = alloc(4 * 2 * 2);
+    xp_fill16(pcm2, 8, 5678);
+    if (msh_client_write(c, pcm2, 4) < 0) { fails = fails + 1; }
+    msh_server_poll(server);
+    if (msh_stream_avail(st) != 8) { fails = fails + 1; }
+    var rb2 = alloc(4 * 2 * 2);
+    if (msh_stream_read(st, rb2, 4) != 4) { fails = fails + 1; }
+    if (msh_sext_s16(load16(rb2 + 0)) != 5678) { fails = fails + 1; }
+
+    msh_shm_free(cbuf);
+    msh_server_close(server);
+    sock_close(cfd);
+    return fails;
+}
+
+# --- Test C: backpressure latch (pending shm buf) + pending-retry, by inspection. ---
+fn test_latch(): i64 {
+    var fails = 0;
+    var router = msh_router_new();
+    var server = msh_server_new(router);
+    if (server == 0) { xp_say("  C: SKIP (listen failed)\n"); return 0; }
+    var cfd = msh_connect();
+    if (cfd < 0) { xp_say("  C: SKIP (connect failed)\n"); msh_server_close(server); return 0; }
+    var h = msh_msg_new();
+    msh_msg_set(h, MSH_HELLO, 2); msh_msg_set_arg(h, 0, 48000); msh_msg_set_arg(h, 1, 2);
+    msh_send(cfd, h);
+    msh_server_poll(server);
+    var w = msh_msg_new();
+    msh_read_msg(cfd, w);
+    var st = load64(msh_router_streams(router) + 0);
+    if (st == 0) { return 1; }
+
+    # Fill the ring so free < one 200-frame (400-sample) block. cap is in SAMPLES
+    # (msh_stream_new sizes it 16384*ch), so derive the fill from cap: leave ~199
+    # samples free. Written directly, bypassing the wire.
+    var cap = msh_stream_cap(st);
+    var fillframes = (cap - 200) / 2;
+    var fbuf = alloc(fillframes * 2 * 2);
+    xp_fill16(fbuf, fillframes * 2, 100);
+    msh_stream_write(st, fbuf, fillframes);
+
+    # A 200-frame shm block (400 samples > 183 free, but <= cap-1) must LATCH.
+    var buf = msh_shm_create(200 * 2 * 2);
+    var pcm = alloc(200 * 2 * 2);
+    xp_fill16(pcm, 400, 4321);
+    msh_shm_write(buf, pcm, 200 * 2 * 2);
+    var wr = msh_msg_new();
+    msh_msg_set(wr, MSH_WRITE_SHM, 2); msh_msg_set_arg(wr, 0, 200); msh_msg_set_arg(wr, 1, buf);
+    msh_send(cfd, wr);
+    msh_server_poll(server);                       # ring can't hold 400 -> latch, no ACK
+
+    var tbl = load64(server + 16);                 # slot 0 at tbl+0
+    if (load64(tbl + 16) != 200) { fails = fails + 1; }   # pending_frames latched
+    if (load64(tbl + 24) != buf) { fails = fails + 1; }   # pending_buf latched (shm id)
+    if (msh_stream_avail(st) != fillframes * 2) { fails = fails + 1; }  # ring unchanged
+
+    # Drain the ring, re-poll -> pending-retry consumes the latched block + ACKs.
+    var drain = alloc(fillframes * 2 * 2);
+    msh_stream_read(st, drain, fillframes);
+    msh_server_poll(server);
+    if (load64(tbl + 16) != 0) { fails = fails + 1; }     # pending cleared
+    if (load64(tbl + 24) != 0) { fails = fails + 1; }
+    if (msh_stream_avail(st) != 400) { fails = fails + 1; }  # 200 frames now in ring
+    var rb = alloc(200 * 2 * 2);
+    msh_stream_read(st, rb, 200);
+    if (msh_sext_s16(load16(rb + 0)) != 4321) { fails = fails + 1; }
+    # The ACK is now waiting (server sent it on the retry).
+    var ackm = msh_msg_new();
+    if (msh_read_msg(cfd, ackm) < 0) { fails = fails + 1; }
+    if (msh_msg_kind(ackm) != MSH_ACK) { fails = fails + 1; }
+    if (msh_msg_arg(ackm, 0) != buf) { fails = fails + 1; }
+
+    msh_shm_free(buf);
+    msh_server_close(server);
+    sock_close(cfd);
+    return fails;
+}
+
+fn main(): i64 {
+    alloc_init();
+    var fails = 0;
+    var a = test_shm_roundtrip();
+    if (a == 0) { xp_say("  A: PASS (shm create/write/read/free round-trip)\n"); }
+    else { xp_say("  A: FAIL (shm primitive)\n"); }
+    fails = fails + a;
+
+    var b = test_write_ack();
+    if (b == 0) { xp_say("  B: PASS (client shm write -> WRITE_SHM -> ring + ACK, reuse guarded)\n"); }
+    else { xp_say("  B: FAIL (write/ack path)\n"); }
+    fails = fails + b;
+
+    var cc = test_latch();
+    if (cc == 0) { xp_say("  C: PASS (backpressure latch -> pending-retry -> ACK)\n"); }
+    else { xp_say("  C: FAIL (backpressure)\n"); }
+    fails = fails + cc;
+
+    if (fails == 0) { xp_say("mishran shm_probe: PASS\n"); return 0; }
+    xp_say("mishran shm_probe: FAIL\n");
+    return 1;
+}
+
+var rc = main();
+syscall(60, rc);

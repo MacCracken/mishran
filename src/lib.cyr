@@ -62,8 +62,10 @@ include "src/mix.cyr"
 include "src/route.cyr"
 
 # Server modules — "route through the mixer" over TCP loopback. proto.cyr (wire
-# messages) is dep-free; transport.cyr (TCP via net.cyr) uses it; server.cyr
-# (accept + dispatch + the app-facing client API) drives the router.
+# messages) is dep-free; shm.cyr (out-of-band PCM buffers) mirrors setu's buf.cyr;
+# transport.cyr (TCP via net.cyr) uses proto; server.cyr (accept + dispatch + the
+# app-facing client API) drives the router and moves PCM over shm.
 include "src/proto.cyr"
+include "src/shm.cyr"
 include "src/transport.cyr"
 include "src/server.cyr"

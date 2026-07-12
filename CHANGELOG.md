@@ -5,7 +5,62 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — PCM over shared memory (lifts the 2 KB TCP-window ceiling)
+
+The two-proc audio path now moves the PCM payload **off the TCP wire and onto a
+shared-memory buffer** — the audio counterpart of setu's framebuffer present. Only a
+tiny control message rides TCP; the samples travel through `sys_shm`. This lifts the
+old inline-`MSH_WRITE` block ceiling (256 frames / 1024 B, forced under the ~2 KB agnos
+loopback recv window): a client can now hand off blocks bounded by the shm buffer, not
+the window. Validated on agnos with 1024-frame (4096 B) blocks — larger than the whole
+TCP window — reaching the DAC (`mishran-duplex-audio-smoke.sh`, RMS 2269 / PEAK 4448, no
+deadlock). Pure userland; no kernel change (the `sys_shm_*` syscalls #71-74 already ship,
+the same ones setu's present uses).
+
+### Added
+
+- **`src/shm.cyr` — out-of-band PCM buffers (`msh_shm_create/write/read/free`).** COPY-
+  based, kernel/OS-owned, keyed by an integer id sent over the wire (no fd passing).
+  `#ifdef CYRIUS_TARGET_AGNOS` → the kernel shm syscalls; Linux → a tmpfs file
+  `/dev/shm/mishran-pcm-<id>`, so the whole path is Linux-first testable. Mirrors setu's
+  `src/buf.cyr` 1:1.
+- **`MSH_WRITE_SHM` (7) + `MSH_ACK` (8) opcodes** (`src/proto.cyr`). `MSH_WRITE_SHM`
+  carries `[nframes, buf_id]` — the PCM is in the shm buffer, not on the wire; the server
+  replies `MSH_ACK(buf_id)` once it has copied the block into the stream ring, releasing
+  the buffer for reuse.
+- **Single-buffer credit/ACK flow control** (`src/server.cyr` `MshClient`). The client
+  owns one shm buffer (`MSH_SHM_BLOCK_FRAMES = 2048`) and reuses it only after the ACK
+  (`msh_client_wait_ack`), so the reuse is race-free (the server copies out *before*
+  acking) and a full server ring simply defers the ack — automatic real-time pacing with
+  no socket-desync risk. `msh_client_write` splits large writes into ≤ block-size shm
+  handoffs. `MshClient` grew to 48 B (buf id + in-flight flag); `msh_client_close` frees
+  the buffer.
+- **Server-side shm consume + latch** (`src/server.cyr` `msh_server_service`,
+  `msh_srv_ack`). `MSH_WRITE_SHM` copies the block out of shm into the ring and ACKs; if
+  the ring is full it **latches** the block (frame count + shm buf id in the client slot,
+  no ack) and the PCM stays safe in the client-owned buffer until a later tick drains the
+  ring and the pending-retry consumes + ACKs it. The per-client slot grew 24 → 32 B
+  (`MSH_SLOT_SZ`, `pending_buf` at +24).
+- **`programs/shm_probe.cyr`** — host proof: shm round-trip · client write → `WRITE_SHM`
+  → ring + ACK (reuse-guarded) · backpressure latch → pending-retry → ACK. All PASS.
+
+### Changed
+
+- **`programs/mishclient.cyr`** streams **1024-frame** blocks (was 256) over the shm path
+  — deliberately above the TCP window, to exercise the ceiling lift.
+- **cyrius pin 6.4.10 → 6.4.49** — the `sys_shm_*` floor is 6.4.33; 6.4.49 matches vani
+  (mishran's vendored sink source). Feature-floor bump, not chasing.
+- The legacy inline `MSH_WRITE` path is **unchanged** (`serve_probe` still PASS) — the
+  server still handles it; only the client API (`msh_client_write`) moved to shm.
+
+### Known
+
+- **Long-running daemon heap growth (pre-existing, not from this change).** The serving
+  loop allocs per-poll message structs + per-block PCM scratch from the bump allocator
+  with no reclamation; a forever-running mixer daemon (`mishrand`) would eventually OOM.
+  Masked by bounded smokes (which exit in ~1.5 s). Tracked for a focused
+  reusable-buffer refactor; surfaced by a 2-lens adversarial-verify pass whose flow-
+  control review otherwise found the shm path sound.
 
 ## [0.4.1] - 2026-07-10 — two-proc audio on agnos (cooperative yield)
 

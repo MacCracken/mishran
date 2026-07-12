@@ -1,0 +1,114 @@
+# @public — mishran SHARED-BUFFER PCM transport (out-of-band, COPY-based).
+#
+# The audio counterpart of setu's buf.cyr. Moves the PCM payload OFF the TCP
+# wire and into a buffer owned by the kernel/OS and keyed by an integer id: the
+# client writes rendered frames into the buffer, sends a tiny MSH_WRITE_SHM
+# control message carrying the id (NOT the samples), and the server reads them
+# back out. This sidesteps the agnos single-CPU two-proc TCP flow-control window
+# (the loopback recv ring is ~2 KB, but a useful audio block is many KB) with a
+# single kernel/OS copy each way — negligible vs the block, and it lifts the old
+# 256-frame per-write ceiling the inline-TCP path needed to stay under the window.
+# See agnosticos/docs/development/planning/blocking-syscall-concurrency.md
+# ("Shared-memory PCM transport for mishran").
+#
+# COPY-based (not shared-page-mapped) on purpose — the buffer is OWNED by the
+# kernel/OS, never mapped into a process's own arena, so a client that exits right
+# after a write can't free pages the server is still reading (agnos
+# proc_free_address_space frees every arena page on exit). The id is a small
+# integer sent over mishran's TCP wire — no fd passing — so it rides the transport
+# unchanged on both targets.
+#   Linux — a tmpfs file /dev/shm/mishran-pcm-<id>: the client write()s it, the
+#           server read()s it. Pure userland; no kernel change.
+#   agnos — the kernel shm syscalls (shm_create #71 / shm_write #72 / shm_read #73
+#           / shm_free #74, cyrius >= 6.4.33). The same primitives setu's present
+#           buffer uses.
+#
+# shm.cyr is dep-light (string/fmt/syscalls from the stdlib chain) and dep-free of
+# the other mishran modules, so it sits near the head of the server band.
+
+var _msh_shm_counter = 0;
+
+# Build "/dev/shm/mishran-pcm-<buf_id>\0" into `out` (caller supplies >= 48 bytes).
+fn msh_shm_path(buf_id, out): i64 {
+    var prefix = "/dev/shm/mishran-pcm-";
+    var plen = strlen(prefix);
+    var i = 0;
+    while (i < plen) { store8(out + i, load8(prefix + i)); i = i + 1; }
+    var nl = fmt_int_buf(buf_id, out + plen);
+    store8(out + plen + nl, 0);
+    return 0;
+}
+
+# Reserve a fresh shared buffer of `size` bytes. Returns a buffer id (> 0) or -1.
+# On Linux this creates + pre-sizes the tmpfs file; fill it with msh_shm_write.
+fn msh_shm_create(size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_shm_create(size);           # shm_create#71 -> kernel buffer id (>=1) / -1
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var pid = syscall(39);                 # getpid — per-proc uniqueness seed
+    _msh_shm_counter = _msh_shm_counter + 1;
+    var id = pid * 100000 + _msh_shm_counter;
+    var path[48];
+    msh_shm_path(id, &path);
+    var fd = sys_open(&path, 577, 384);    # O_WRONLY|O_CREAT|O_TRUNC (1|64|512), mode 0600
+    if (fd < 0) { return 0 - 1; }
+    syscall(77, fd, size);                 # ftruncate to size (pre-size)
+    sys_close(fd);
+    return id;
+    #endif
+}
+
+# Copy `size` bytes from `src` INTO shared buffer `buf_id`. Returns 0 / -1.
+fn msh_shm_write(buf_id, src, size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_shm_write(buf_id, src, size);   # shm_write#72: user src -> kernel buffer
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    msh_shm_path(buf_id, &path);
+    var fd = sys_open(&path, 1, 0);        # O_WRONLY
+    if (fd < 0) { return 0 - 1; }
+    var sent = 0;
+    while (sent < size) {
+        var w = sys_write(fd, src + sent, size - sent);
+        if (w <= 0) { sys_close(fd); return 0 - 1; }
+        sent = sent + w;
+    }
+    sys_close(fd);
+    return 0;
+    #endif
+}
+
+# Copy `size` bytes OUT of shared buffer `buf_id` into `dst`. Returns 0 / -1.
+fn msh_shm_read(buf_id, dst, size): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_shm_read(buf_id, dst, size);    # shm_read#73: kernel buffer -> user dst
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    msh_shm_path(buf_id, &path);
+    var fd = sys_open(&path, 0, 0);        # O_RDONLY
+    if (fd < 0) { return 0 - 1; }
+    var got = 0;
+    while (got < size) {
+        var r = sys_read(fd, dst + got, size - got);
+        if (r <= 0) { sys_close(fd); return 0 - 1; }
+        got = got + r;
+    }
+    sys_close(fd);
+    return 0;
+    #endif
+}
+
+# Destroy the buffer (client owner). Returns 0 / -1.
+fn msh_shm_free(buf_id): i64 {
+    #ifdef CYRIUS_TARGET_AGNOS
+    return sys_shm_free(buf_id);           # shm_free#74
+    #endif
+    #ifndef CYRIUS_TARGET_AGNOS
+    var path[48];
+    msh_shm_path(buf_id, &path);
+    return syscall(87, &path);             # unlink
+    #endif
+}
