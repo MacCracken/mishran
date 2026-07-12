@@ -64,7 +64,10 @@ fn main(): i64 {
     var server = msh_server_new(router);
     if (server == 0) { clp_say("client_leak_probe: SKIP (listen failed — no loopback?)\n"); return 0; }
     var cfd = msh_connect();
-    if (cfd < 0) { clp_say("client_leak_probe: SKIP (connect failed — no loopback?)\n"); msh_server_close(server); return 0; }
+    if (cfd < 0) {
+        clp_say("client_leak_probe: SKIP (connect failed — no loopback?)\n");
+        msh_server_close(server); return 0;
+    }
 
     # Manual handshake (single-process: msh_client_connect would block on WELCOME
     # since nothing polls the server), then hand-build the client around cfd and
@@ -109,8 +112,9 @@ fn main(): i64 {
 
     # Split-attribute the measured window: cw = bytes alloc'd inside msh_client_write
     # (the fix target), pl = bytes alloc'd inside msh_server_poll + ring drain (the
-    # net.cyr sock_accept per-poll residual — out of scope). alloc_used() just reads
-    # the bump _heap_used counter, so snapshotting around each call is free.
+    # net.cyr sock_accept per-poll residual, a pre-existing stdlib leak this fix
+    # leaves alone). alloc_used() just reads the bump _heap_used counter, so
+    # snapshotting around each call is free.
     var cw = 0;
     var pl = 0;
     var n = 0;
@@ -121,7 +125,9 @@ fn main(): i64 {
         cw = cw + (a1 - a0);
         msh_server_poll(server);                          # WRITE_SHM -> ring + ACK (+ accept poll)
         if (msh_stream_avail(st) != CLP_FRAMES * CLP_CH) { clp_say("client_leak_probe: FAIL (ring)\n"); return 1; }
-        if (msh_stream_read(st, rb, CLP_FRAMES) != CLP_FRAMES) { clp_say("client_leak_probe: FAIL (drain)\n"); return 1; }
+        if (msh_stream_read(st, rb, CLP_FRAMES) != CLP_FRAMES) {
+            clp_say("client_leak_probe: FAIL (drain)\n"); return 1;
+        }
         pl = pl + (alloc_used() - a1);
         n = n + 1;
     }
@@ -132,7 +138,7 @@ fn main(): i64 {
 
     clp_say("client_leak_probe: "); clp_sayn(CLP_BLOCKS); clp_say(" blocks\n");
     clp_say("  msh_client_write growth  = "); clp_sayn(cw); clp_say(" bytes (fix target — want 0)\n");
-    clp_say("  msh_server_poll growth   = "); clp_sayn(pl); clp_say(" bytes (net.cyr sock_accept residual — out of scope)\n");
+    clp_say("  msh_server_poll growth   = "); clp_sayn(pl); clp_say(" bytes (net.cyr sock_accept, pre-existing)\n");
     if (cw == 0) { clp_say("client_leak_probe: PASS (client hot path 0 steady-state growth)\n"); return 0; }
     clp_say("client_leak_probe: FAIL (client hot path still leaks)\n");
     return 1;
