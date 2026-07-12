@@ -64,6 +64,8 @@ fn test_write_ack(): i64 {
     store64(c + MSH_CL_RATE, 48000);
     store64(c + MSH_CL_CH, 2);
     store64(c + MSH_CL_INFLIGHT, 0);
+    store64(c + MSH_CL_MSG, msh_msg_new());        # reused scratch (connect sets these; hand-built here)
+    store64(c + MSH_CL_WBUF, alloc(MSH_MSG_SZ));
     var cbuf = msh_shm_create(MSH_SHM_BLOCK_FRAMES * 2 * 2);
     if (cbuf <= 0) { fails = fails + 1; }
     store64(c + MSH_CL_BUF, cbuf);

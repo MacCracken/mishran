@@ -291,7 +291,9 @@ enum MshClientOff {
     MSH_CL_CH       = 24;
     MSH_CL_BUF      = 32;   # the single out-of-band shm PCM buffer id
     MSH_CL_INFLIGHT = 40;   # 1 = a block is in flight (buffer busy until ACK)
-    MSH_CL_SZ       = 48;
+    MSH_CL_MSG      = 48;   # reused MshMsg for encode/decode — hot path allocates nothing
+    MSH_CL_WBUF     = 56;   # reused wire scratch (MSH_MSG_SZ) for msh_send_buf / msh_read_msg_buf
+    MSH_CL_SZ       = 64;
 }
 
 enum MshClientShm {
@@ -329,6 +331,15 @@ fn msh_client_connect(rate, ch): i64 {
     if (buf <= 0) { sock_close(fd); return 0; }
     store64(c + MSH_CL_BUF, buf);
     store64(c + MSH_CL_INFLIGHT, 0);
+    # Reusable client-owned scratch so the per-block write + per-ACK wait hot path
+    # allocates NOTHING — the app-facing mirror of the server's reusable buffers
+    # (msh_server_new). The bump heap has no per-object free, so a per-block alloc
+    # here leaks ~192 B/block (~2 MB per 4-min song); a full playlist would OOM the
+    # arena. The WELCOME message `w` (its stream-id arg already read into MSH_CL_ID
+    # above) is repurposed as the reused MshMsg; a fresh MSH_MSG_SZ wire buffer backs
+    # msh_send_buf / msh_read_msg_buf.
+    store64(c + MSH_CL_MSG, w);
+    store64(c + MSH_CL_WBUF, alloc(MSH_MSG_SZ));
     return c;
 }
 
@@ -338,14 +349,15 @@ fn msh_client_id(c): i64 { return load64(c + MSH_CL_ID); }
 # Block (cooperatively) until the server ACKs the in-flight buffer, clearing the
 # in-flight flag so the buffer may be reused. Loops reading control messages until
 # the ACK arrives (after WELCOME the server sends only MSH_ACK). On agnos each
-# read cooperatively yields (msh_read_msg) so the server runs to drain + ack — a
+# read cooperatively yields (msh_read_msg_buf) so the server runs to drain + ack — a
 # full server ring simply defers the ack, stalling the client in real-time pace.
 # Returns 0, or -6 on EOF / error.
 fn msh_client_wait_ack(c): i64 {
-    var fd = load64(c + MSH_CL_FD);
+    var fd   = load64(c + MSH_CL_FD);
+    var m    = load64(c + MSH_CL_MSG);    # reused — was a per-read msh_msg_new leak
+    var wbuf = load64(c + MSH_CL_WBUF);
     while (load64(c + MSH_CL_INFLIGHT) != 0) {
-        var m = msh_msg_new();
-        if (msh_read_msg(fd, m) < 0) { return 0 - 6; }
+        if (msh_read_msg_buf(fd, m, wbuf) < 0) { return 0 - 6; }
         if (msh_msg_kind(m) == MSH_ACK) { store64(c + MSH_CL_INFLIGHT, 0); }
     }
     return 0;
@@ -359,22 +371,26 @@ fn msh_client_wait_ack(c): i64 {
 # race-free, and a full ring defers the ack = automatic real-time pacing).
 # Returns 0, or -7 on a send / shm error.
 fn msh_client_write(c, pcm, nframes): i64 {
-    var fd  = load64(c + MSH_CL_FD);
-    var ch  = load64(c + MSH_CL_CH);
-    var buf = load64(c + MSH_CL_BUF);
+    var fd   = load64(c + MSH_CL_FD);
+    var ch   = load64(c + MSH_CL_CH);
+    var buf  = load64(c + MSH_CL_BUF);
+    var m    = load64(c + MSH_CL_MSG);             # reused — was a per-block msh_msg_new leak
+    var wbuf = load64(c + MSH_CL_WBUF);            # reused wire scratch for msh_send_buf
     var off = 0;                                   # frames already handed off
     while (off < nframes) {
         var chunk = nframes - off;
         if (chunk > MSH_SHM_BLOCK_FRAMES) { chunk = MSH_SHM_BLOCK_FRAMES; }
+        # wait_ack reuses the same MSH_CL_MSG/MSH_CL_WBUF, but it runs to completion
+        # (reads the ACK into m) BEFORE we rebuild m as WRITE_SHM below — sequential,
+        # so the single reused scratch is safe.
         if (load64(c + MSH_CL_INFLIGHT) != 0) {
             if (msh_client_wait_ack(c) < 0) { return 0 - 7; }
         }
         if (msh_shm_write(buf, pcm + off * ch * 2, chunk * ch * 2) < 0) { return 0 - 7; }
-        var m = msh_msg_new();
         msh_msg_set(m, MSH_WRITE_SHM, 2);
         msh_msg_set_arg(m, 0, chunk);
         msh_msg_set_arg(m, 1, buf);
-        if (msh_send(fd, m) < 0) { return 0 - 7; }
+        if (msh_send_buf(fd, m, wbuf) < 0) { return 0 - 7; }
         store64(c + MSH_CL_INFLIGHT, 1);
         off = off + chunk;
     }
@@ -383,11 +399,12 @@ fn msh_client_write(c, pcm, nframes): i64 {
 
 # Set this stream's Q8 gain (256 = unity, 0 = mute). Returns 0 / -7.
 fn msh_client_gain(c, gain): i64 {
-    var fd = load64(c + MSH_CL_FD);
-    var m = msh_msg_new();
+    var fd   = load64(c + MSH_CL_FD);
+    var m    = load64(c + MSH_CL_MSG);             # reused (a player may re-set volume repeatedly)
+    var wbuf = load64(c + MSH_CL_WBUF);
     msh_msg_set(m, MSH_GAIN, 1);
     msh_msg_set_arg(m, 0, gain);
-    if (msh_send(fd, m) < 0) { return 0 - 7; }
+    if (msh_send_buf(fd, m, wbuf) < 0) { return 0 - 7; }
     return 0;
 }
 
@@ -395,10 +412,11 @@ fn msh_client_gain(c, gain): i64 {
 # still-in-flight final block may be lost (the server drops the stream on BYE /
 # on a failed read of the freed buffer) — inconsequential at shutdown.
 fn msh_client_close(c): i64 {
-    var fd = load64(c + MSH_CL_FD);
-    var m = msh_msg_new();
+    var fd   = load64(c + MSH_CL_FD);
+    var m    = load64(c + MSH_CL_MSG);             # reused (no reason to alloc at shutdown)
+    var wbuf = load64(c + MSH_CL_WBUF);
     msh_msg_set(m, MSH_BYE, 0);
-    msh_send(fd, m);
+    msh_send_buf(fd, m, wbuf);
     var buf = load64(c + MSH_CL_BUF);
     if (buf > 0) { msh_shm_free(buf); }
     sock_close(fd);

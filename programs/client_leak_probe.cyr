@@ -1,0 +1,142 @@
+# programs/client_leak_probe.cyr — host proof that the app-facing MshClient hot
+# path allocates NOTHING per block. The 0.5.0 cut closed the SERVER-side per-poll /
+# per-block heap leak (msh_server_service / msh_srv_ack); this probe guards its
+# CLIENT-side MIRROR: msh_client_write (was a per-block msh_msg_new + msh_send
+# alloc) and msh_client_wait_ack (was a per-read msh_msg_new + msh_read_msg alloc).
+# On the bump allocator (no per-object free) that leaked ~192 B/block — ~2 MB per
+# 4-min song — so a long playlist through the two-proc mixer would OOM the arena.
+#
+# Single-process (no fork), like shm_probe test B: after each client write we poll
+# the server (copies the block into the ring + ACKs, releasing the buffer) and
+# drain the ring so the next write's wait_ack reads the ACK — exercising BOTH hot
+# paths. We warm up first (the server's grow-on-demand PCM scratch allocs once for
+# the block size), then measure alloc_used() across MANY blocks.
+#
+# The measurement is SPLIT per iteration: bytes allocated inside msh_client_write
+# (the fix target — MUST be 0 in steady state) vs bytes allocated inside
+# msh_server_poll + ring drain. The poll side is NON-zero and that is expected + out
+# of scope: net.cyr's sock_accept allocs ~40 B on every EAGAIN poll (a client_addr +
+# addrlen + Err Result), a pre-existing SERVER-accept leak in the materialized stdlib,
+# nothing to do with the app-facing client hot path. PASS keys ONLY on the client
+# write growth being 0. Exit 0 = PASS. Host-only.
+
+include "src/lib.cyr"
+
+enum ClpCfg {
+    CLP_FRAMES = 64;       # stereo frames per block (small: ring never latches, drain is cheap)
+    CLP_CH     = 2;
+    CLP_WARMUP = 8;        # settle one-time allocs (server PCM scratch) before measuring
+    CLP_BLOCKS = 20000;    # measured blocks (matches the 0.5.0 server-leak probe's 20k)
+}
+
+fn clp_say(s): i64 { return syscall(1, 1, s, strlen(s)); }
+
+# print a non-negative integer to stdout (diagnostic only — called OUTSIDE the
+# measurement window so its own allocs don't perturb the reading).
+fn clp_sayn(n): i64 {
+    if (n == 0) { return syscall(1, 1, "0", 1); }
+    var tmp = alloc(24);
+    var i = 0;
+    var v = n;
+    while (v > 0) { store8(tmp + i, 48 + (v - (v / 10) * 10)); i = i + 1; v = v / 10; }
+    var out = alloc(24);
+    var j = 0;
+    while (j < i) { store8(out + j, load8(tmp + (i - 1 - j))); j = j + 1; }
+    return syscall(1, 1, out, i);
+}
+
+# One block round-trip: client write -> server poll (WRITE_SHM -> ring + ACK) ->
+# drain the ring so the ACK keeps flowing (a full ring would latch, no ACK). `pcm`
+# and `rb` are caller-owned (allocated once) so the harness itself adds no per-block
+# alloc — only the code under test can. Returns 0, or -1 on any failure.
+fn clp_step(c, server, st, pcm, rb): i64 {
+    if (msh_client_write(c, pcm, CLP_FRAMES) < 0) { return 0 - 1; }
+    msh_server_poll(server);                          # WRITE_SHM -> shm_read + ring write + ACK
+    if (msh_stream_avail(st) != CLP_FRAMES * CLP_CH) { return 0 - 1; }
+    if (msh_stream_read(st, rb, CLP_FRAMES) != CLP_FRAMES) { return 0 - 1; }
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+
+    var router = msh_router_new();
+    var server = msh_server_new(router);
+    if (server == 0) { clp_say("client_leak_probe: SKIP (listen failed — no loopback?)\n"); return 0; }
+    var cfd = msh_connect();
+    if (cfd < 0) { clp_say("client_leak_probe: SKIP (connect failed — no loopback?)\n"); msh_server_close(server); return 0; }
+
+    # Manual handshake (single-process: msh_client_connect would block on WELCOME
+    # since nothing polls the server), then hand-build the client around cfd and
+    # drive the REAL msh_client_write / wait_ack — same shape as shm_probe test B.
+    var h = msh_msg_new();
+    msh_msg_set(h, MSH_HELLO, 2); msh_msg_set_arg(h, 0, 48000); msh_msg_set_arg(h, 1, CLP_CH);
+    msh_send(cfd, h);
+    msh_server_poll(server);
+    var w = msh_msg_new();
+    if (msh_read_msg(cfd, w) < 0) { clp_say("client_leak_probe: FAIL (no WELCOME)\n"); return 1; }
+    var sid = msh_msg_arg(w, 0);
+    var st = load64(msh_router_streams(router) + 0);
+    if (st == 0) { clp_say("client_leak_probe: FAIL (no stream)\n"); return 1; }
+
+    var c = alloc(MSH_CL_SZ);
+    store64(c + MSH_CL_FD, cfd);
+    store64(c + MSH_CL_ID, sid);
+    store64(c + MSH_CL_RATE, 48000);
+    store64(c + MSH_CL_CH, CLP_CH);
+    store64(c + MSH_CL_INFLIGHT, 0);
+    store64(c + MSH_CL_MSG, msh_msg_new());           # reused scratch (connect sets these; hand-built here)
+    store64(c + MSH_CL_WBUF, alloc(MSH_MSG_SZ));
+    var cbuf = msh_shm_create(MSH_SHM_BLOCK_FRAMES * CLP_CH * 2);
+    if (cbuf <= 0) { clp_say("client_leak_probe: FAIL (shm create)\n"); return 1; }
+    store64(c + MSH_CL_BUF, cbuf);
+
+    # Caller-owned block source + ring drain buffer — allocated ONCE so the harness
+    # adds no per-block alloc.
+    var pcm = alloc(CLP_FRAMES * CLP_CH * 2);
+    var i = 0;
+    while (i < CLP_FRAMES * CLP_CH) { store16(pcm + i * 2, 1234); i = i + 1; }
+    var rb = alloc(CLP_FRAMES * CLP_CH * 2);
+
+    # Warmup: run a handful of blocks so the server's grow-on-demand PCM copy-out
+    # scratch (msh_server_pcm) allocs its one-time buffer for this block size BEFORE
+    # we sample the baseline.
+    var wu = 0;
+    while (wu < CLP_WARMUP) {
+        if (clp_step(c, server, st, pcm, rb) < 0) { clp_say("client_leak_probe: FAIL (warmup step)\n"); return 1; }
+        wu = wu + 1;
+    }
+
+    # Split-attribute the measured window: cw = bytes alloc'd inside msh_client_write
+    # (the fix target), pl = bytes alloc'd inside msh_server_poll + ring drain (the
+    # net.cyr sock_accept per-poll residual — out of scope). alloc_used() just reads
+    # the bump _heap_used counter, so snapshotting around each call is free.
+    var cw = 0;
+    var pl = 0;
+    var n = 0;
+    while (n < CLP_BLOCKS) {
+        var a0 = alloc_used();
+        if (msh_client_write(c, pcm, CLP_FRAMES) < 0) { clp_say("client_leak_probe: FAIL (write step)\n"); return 1; }
+        var a1 = alloc_used();
+        cw = cw + (a1 - a0);
+        msh_server_poll(server);                          # WRITE_SHM -> ring + ACK (+ accept poll)
+        if (msh_stream_avail(st) != CLP_FRAMES * CLP_CH) { clp_say("client_leak_probe: FAIL (ring)\n"); return 1; }
+        if (msh_stream_read(st, rb, CLP_FRAMES) != CLP_FRAMES) { clp_say("client_leak_probe: FAIL (drain)\n"); return 1; }
+        pl = pl + (alloc_used() - a1);
+        n = n + 1;
+    }
+
+    msh_shm_free(cbuf);
+    msh_server_close(server);
+    sock_close(cfd);
+
+    clp_say("client_leak_probe: "); clp_sayn(CLP_BLOCKS); clp_say(" blocks\n");
+    clp_say("  msh_client_write growth  = "); clp_sayn(cw); clp_say(" bytes (fix target — want 0)\n");
+    clp_say("  msh_server_poll growth   = "); clp_sayn(pl); clp_say(" bytes (net.cyr sock_accept residual — out of scope)\n");
+    if (cw == 0) { clp_say("client_leak_probe: PASS (client hot path 0 steady-state growth)\n"); return 0; }
+    clp_say("client_leak_probe: FAIL (client hot path still leaks)\n");
+    return 1;
+}
+
+var rc = main();
+syscall(60, rc);

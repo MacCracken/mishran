@@ -5,6 +5,49 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-07-12 — the app-facing client's hot-path leak (mirror of 0.5.0)
+
+0.5.0 closed the routing **server**'s per-poll / per-block heap leak; this patch closes
+its exact **mirror on the app-facing `MshClient` API**. The client hot path allocated
+from the bump allocator (which has no per-object free) on every audio block and every
+ACK wait, so a long-running player — jalwa streaming a full playlist through the
+two-proc mixer — slowly leaked the heap the same way the daemon did. Pure userland; the
+wire and behaviour are unchanged (identical messages, identical flow) — only *where* the
+message + wire buffers come from moved from a per-call `alloc` to client-owned reusable
+buffers.
+
+### Fixed
+
+- **Unbounded client-side heap leak on the `MshClient` hot path (mirror of the 0.5.0
+  serving-loop fix).** Every `msh_client_write` allocated a `MshMsg` (`msh_msg_new`,
+  48 B) + a wire encode buffer (`msh_send` → `alloc(MSH_MSG_SZ)`, 48 B) per block, and
+  every `msh_client_wait_ack` allocated a `MshMsg` + a wire read buffer (`msh_read_msg`,
+  48 B) per ACK read — **~192 B/block** on a bump allocator that never frees (≈ 2 MB per
+  4-min song; a full playlist accumulates on the agnos arena and eventually OOMs). Fixed
+  with **client-owned reusable buffers** on `MshClient` (`MSH_CL_SZ` 48 → 64 B): one
+  reused `MshMsg` (`MSH_CL_MSG`) + one reused wire scratch (`MSH_CL_WBUF`, `MSH_MSG_SZ`),
+  both set once in `msh_client_connect` (the WELCOME message is repurposed as the reused
+  `MshMsg`). New **alloc-free transport variants** `msh_send_buf` / `msh_read_msg_buf`
+  take a caller-supplied wire buffer; `msh_send` / `msh_read_msg` stay as allocating
+  wrappers for the one-shot connect handshake. The whole hot client path
+  (`msh_client_write`, `msh_client_wait_ack`, and `msh_client_gain` / `_close`) now
+  allocates **nothing** per block. A host leak probe (`programs/client_leak_probe.cyr`)
+  measuring `alloc_used()` across **20 000 blocks**: `msh_client_write` growth **0 bytes**
+  in steady state, versus ~192 B/block before. Re-validated end-to-end on agnos
+  (`mishran-duplex-audio-smoke.sh`: two concurrent procs, sustained tone to the DAC,
+  RMS 2229 / PEAK 4448, no deadlock/regression).
+
+### Added
+
+- **`programs/client_leak_probe.cyr`** — host proof that the `MshClient` hot path is
+  alloc-free. Single-process (no fork), it drives the real `msh_client_write` /
+  `msh_client_wait_ack` against an in-process server, splitting the per-block
+  `alloc_used()` delta into the client write (**must be 0**) vs the `msh_server_poll`
+  residual. The poll residual is non-zero and **out of scope**: net.cyr's `sock_accept`
+  allocs ~40 B on every EAGAIN poll (a `client_addr` + `addrlen` + `Err` Result) — a
+  pre-existing per-poll leak in the materialized stdlib that also affects the `mishrand`
+  daemon's accept loop, to be addressed in cyrius, not here.
+
 ## [0.5.0] - 2026-07-11 — PCM over shared memory + the serving-loop leak fix
 
 The two-proc audio path now moves the PCM payload **off the TCP wire and onto a

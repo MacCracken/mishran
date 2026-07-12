@@ -77,14 +77,24 @@ fn msh_write_all(fd, buf, n): i64 {
     return n;
 }
 
-# Encode `m` and write the whole frame. Returns bytes written (> 0), an encode
-# error (< 0), or -7 on a write error.
-fn msh_send(fd, m): i64 {
-    var buf = alloc(MSH_MSG_SZ);
+# Encode `m` into the caller-supplied wire buffer `buf` (>= MSH_MSG_SZ) and write
+# the whole frame — ALLOC-FREE, for hot paths (the client's per-block write) that
+# must not churn the bump heap: on a bump allocator with no per-object free, a
+# per-block alloc leaks unboundedly and a long-running player OOMs. Returns bytes
+# written (> 0), an encode error (< 0), or -7 on a write error. Mirrors the server's
+# msh_srv_ack / msh_try_read_msg caller-owned-buffer pattern.
+fn msh_send_buf(fd, m, buf): i64 {
     var enc = msh_encode(m, buf, MSH_MSG_SZ);
     if (enc < 0) { return enc; }
     if (msh_write_all(fd, buf, enc) < 0) { return 0 - 7; }
     return enc;
+}
+
+# Allocating convenience wrapper over msh_send_buf — for ONE-SHOT callers (the
+# connect HELLO, the server's WELCOME reply) where a single bump alloc never
+# accumulates. Hot paths pass their own reused buffer to msh_send_buf directly.
+fn msh_send(fd, m): i64 {
+    return msh_send_buf(fd, m, alloc(MSH_MSG_SZ));
 }
 
 # Blocking read of >= 1 byte into `buf` (cap `cap`). Absorbs agnos's non-blocking
@@ -132,10 +142,10 @@ fn msh_read_exact(fd, buf, n): i64 {
 }
 
 # Blocking read of ONE length-framed message into `m` (header gives argc → total
-# (2+argc)*8 bytes). Returns the frame length (> 0), -6 on EOF/short read, or -1
-# on a bad frame. Use for the client's WELCOME handshake.
-fn msh_read_msg(fd, m): i64 {
-    var buf = alloc(MSH_MSG_SZ);
+# (2+argc)*8 bytes) using the caller-supplied wire buffer `buf` (>= MSH_MSG_SZ) —
+# ALLOC-FREE, the read mirror of msh_send_buf for the client's per-ACK wait loop.
+# Returns the frame length (> 0), -6 on EOF/short read, or -1 on a bad frame.
+fn msh_read_msg_buf(fd, m, buf): i64 {
     if (msh_read_exact(fd, buf, 16) < 0) { return 0 - 6; }
     var argc = load64(buf + 8);
     if (argc < 0) { return 0 - 1; }
@@ -145,6 +155,13 @@ fn msh_read_msg(fd, m): i64 {
         if (msh_read_exact(fd, buf + 16, total - 16) < 0) { return 0 - 6; }
     }
     return msh_decode(buf, total, m);
+}
+
+# Allocating convenience wrapper over msh_read_msg_buf — for the ONE-SHOT client
+# WELCOME handshake. The per-ACK wait loop passes its reused buffer to
+# msh_read_msg_buf directly.
+fn msh_read_msg(fd, m): i64 {
+    return msh_read_msg_buf(fd, m, alloc(MSH_MSG_SZ));
 }
 
 # NON-BLOCKING read of ONE message into `m` for the server poll. Returns 1 with a
