@@ -5,6 +5,27 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-12 — repin to cyrius 6.4.61 (the daemon is now leak-free end-to-end)
+
+0.5.0/0.5.1 made mishran's own serving loop + client hot path alloc-free, but the
+`client_leak_probe` still measured a non-zero `msh_server_poll` residual — the daemon's
+accept loop dripping through **`net.cyr`'s `sock_accept`**, which allocated on every
+would-block poll (a consumer-filed cyrius issue). **cyrius 6.4.61** fixes it
+(`accept(NULL, NULL)` — the peer address was never read — plus a shared `_net_eagain()`
+`Err` singleton for the would-block path, regression-gated by cyrius's
+`tests/net_accept_no_leak.sh`). This patch repins mishran to receive it: the
+`mishrand` mixer daemon that serves concurrent apps is now leak-free end-to-end.
+
+### Changed
+
+- **cyrius pin 6.4.49 → 6.4.61** — picks up the `net.cyr` `sock_accept` per-poll
+  alloc-leak fix. With it, `programs/client_leak_probe.cyr` now measures
+  **`msh_server_poll growth = 0 bytes`** over 20 000 blocks (was non-zero at 6.4.49) —
+  the accept loop no longer drips. Probe labels + comments updated from
+  "pre-existing residual" to "fixed in cyrius 6.4.61". All host probes
+  (`serve_probe` / `shm_probe` / `client_leak_probe`) + the three `--agnos` daemon
+  builds re-verified green.
+
 ## [0.5.1] - 2026-07-12 — the app-facing client's hot-path leak (mirror of 0.5.0)
 
 0.5.0 closed the routing **server**'s per-poll / per-block heap leak; this patch closes

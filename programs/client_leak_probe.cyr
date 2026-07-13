@@ -15,10 +15,12 @@
 # The measurement is SPLIT per iteration: bytes allocated inside msh_client_write
 # (the fix target — MUST be 0 in steady state) vs bytes allocated inside
 # msh_server_poll + ring drain. The poll side is NON-zero and that is expected + out
-# of scope: net.cyr's sock_accept allocs ~40 B on every EAGAIN poll (a client_addr +
-# addrlen + Err Result), a pre-existing SERVER-accept leak in the materialized stdlib,
-# nothing to do with the app-facing client hot path. PASS keys ONLY on the client
-# write growth being 0. Exit 0 = PASS. Host-only.
+# of scope for THIS probe (it keys only on the client write growth being 0):
+# net.cyr's sock_accept used to alloc ~40 B on every EAGAIN poll (a client_addr +
+# addrlen + Err Result) — a SERVER-accept stdlib leak. **Fixed in cyrius 6.4.61**
+# (accept(NULL,NULL) + a shared _net_eagain() Err singleton), so on pin >= 6.4.61 the
+# poll side now measures 0 too and the daemon is leak-free end-to-end. Exit 0 = PASS.
+# Host-only.
 
 include "src/lib.cyr"
 
@@ -112,8 +114,8 @@ fn main(): i64 {
 
     # Split-attribute the measured window: cw = bytes alloc'd inside msh_client_write
     # (the fix target), pl = bytes alloc'd inside msh_server_poll + ring drain (the
-    # net.cyr sock_accept per-poll residual, a pre-existing stdlib leak this fix
-    # leaves alone). alloc_used() just reads the bump _heap_used counter, so
+    # net.cyr sock_accept per-poll residual — a stdlib leak FIXED in cyrius 6.4.61,
+    # so on pin >= 6.4.61 pl is 0 too). alloc_used() just reads the bump _heap_used counter, so
     # snapshotting around each call is free.
     var cw = 0;
     var pl = 0;
@@ -138,7 +140,7 @@ fn main(): i64 {
 
     clp_say("client_leak_probe: "); clp_sayn(CLP_BLOCKS); clp_say(" blocks\n");
     clp_say("  msh_client_write growth  = "); clp_sayn(cw); clp_say(" bytes (fix target — want 0)\n");
-    clp_say("  msh_server_poll growth   = "); clp_sayn(pl); clp_say(" bytes (net.cyr sock_accept, pre-existing)\n");
+    clp_say("  msh_server_poll growth   = "); clp_sayn(pl); clp_say(" bytes (net.cyr sock_accept, fixed 6.4.61)\n");
     if (cw == 0) { clp_say("client_leak_probe: PASS (client hot path 0 steady-state growth)\n"); return 0; }
     clp_say("client_leak_probe: FAIL (client hot path still leaks)\n");
     return 1;
