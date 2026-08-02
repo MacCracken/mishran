@@ -5,7 +5,7 @@ description = "mishran (मिश्रण — mixing) — pure-Cyrius software 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/mishran"
 language = "cyrius"
-cyrius = "6.4.61"
+cyrius = "6.5.5"
 
 # mishran is a library — no CLI binary yet. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
