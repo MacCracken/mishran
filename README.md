@@ -35,7 +35,7 @@ processes can share the one hardware writer. Proven on agnos: a
 > (`mishduplex` + `mishclient`)". That was a **FALSE GREEN**: the only proof,
 > `mishran-duplex-audio-smoke.sh`, ran under a `MISHRAN_DUPLEX_SELFTEST` kernel
 > hook that assigned `net_ip = 0x7F000001`; agnos puts `net_ip` in an outbound
-> SYN's SOURCE, so on an ordinary boot the client's loopback connect could never
+> SYN's SOURCE, so before `net_src_for` (agnos 1.56.34) the client's loopback connect could not
 > match a 4-tuple and the two procs could not talk at all. Hook and smoke are
 > **deleted**. **TCP-on-loopback is not the local IPC transport** — the
 > replacement is the agnos socket (`naadi`), agnos

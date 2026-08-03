@@ -2,14 +2,18 @@
 #
 # ⛔⛔ WRONG PREMISE — TCP-ON-LOOPBACK IS RETIRED AS A LOCAL TRANSPORT (2026-08-03).
 # This file was modeled 1:1 on setu's reference transport, and it inherited setu's mistake.
-# On agnos the handshake could not close on an ordinary boot: every outbound segment claimed
-# `net_ip` as its source, so a SYN to 127.0.0.1 was answered on a 4-tuple the client's own conn
-# could never match. The only agnos runs that ever passed did so under the
-# `MISHRAN_DUPLEX_SELFTEST` kernel hook, which assigned `net_ip = 0x7F000001` and made src and
-# dst agree by accident. That hook and its smokes are DELETED, and every "two-proc audio on
-# agnos" green resting on them is a FALSE GREEN (see this repo's CHANGELOG retractions).
+# On agnos, BEFORE `net_src_for` (agnos 1.56.34), the handshake could not close on an ordinary
+# boot: every outbound segment claimed `net_ip` as its source, so a SYN to 127.0.0.1 was answered
+# on a 4-tuple the client's own conn could not match. The only agnos runs that passed IN THAT ERA
+# did so under the `MISHRAN_DUPLEX_SELFTEST` kernel hook, which assigned `net_ip = 0x7F000001` and
+# made src and dst agree by accident. That hook and its smokes are DELETED, and every "two-proc
+# audio on agnos" green resting on them is a FALSE GREEN (see this repo's CHANGELOG retractions).
+# ⚠ SCOPE, both ways: `net_src_for` fixed the source-selection mechanism, and setu's equivalent
+# path DID connect un-rigged afterwards (`aethersafha-clients-test.py`, QEMU `-smp 1`, 2026-08-02).
+# mishran's own 7701 wire was never re-tested post-fix, so the honest statement is that it was
+# NEVER HONESTLY DEMONSTRATED on agnos — not that it could not work. Do not claim either.
 # ⛔ The claim below — "cross-platform by construction ... the same wire runs on Linux and the
-# sovereign kernel" — WAS FALSE for agnos. The replacement is the agnos socket (`naadi`), agnos
+# sovereign kernel" — was NOT ESTABLISHED for agnos. The replacement is the agnos socket (`naadi`), agnos
 # `docs/development/planning/ipc.md` §9/§10; per §10.3 this whole socket body comes out,
 # including the `SO_REUSEADDR` that exists only to survive a restart race a placed channel
 # cannot have. Do NOT build on this file, and do NOT copy it into a new local IPC path.

@@ -125,7 +125,7 @@ the same ones setu's present uses).
 > ⛔ **RETRACTED 2026-08-03 — the agnos validation above was a FALSE GREEN.**
 > `mishran-duplex-audio-smoke.sh` passed only because the `MISHRAN_DUPLEX_SELFTEST` kernel hook
 > assigned `net_ip = 0x7F000001`; without it the two procs could not complete a loopback
-> handshake at all, so nothing was proven about block ceilings on agnos. Note also that "only a
+> handshake at all *in that era* (before `net_src_for`, agnos 1.56.34), so nothing was proven about block ceilings on agnos. Note also that "only a
 > tiny control message rides TCP" is **not** the design going forward: local control messages
 > move to the agnos socket (`naadi`). The shm PCM payload path is unaffected by this retraction.
 > See agnos `docs/development/planning/ipc.md` §9-§10.
