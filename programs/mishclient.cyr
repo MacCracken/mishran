@@ -1,7 +1,12 @@
 # programs/mishclient.cyr — the mishran two-proc audio CLIENT (secondary proc).
 #
+# ⛔ THE TRANSPORT THIS PROGRAM EXERCISES IS RETIRED (2026-08-03) and every agnos green attached
+# to it was a FALSE GREEN produced by the `MISHRAN_DUPLEX_SELFTEST` kernel hook's
+# `net_ip = 0x7F000001` assignment. Hook and smoke are deleted. Replacement: the agnos socket
+# (`naadi`) — agnos `docs/development/planning/ipc.md` §9/§10.
+#
 # Spawned by /bin/mishduplex (the server primary) AFTER it has bound loopback:7701
-# + opened the vani sink — the proven desktop ordering (aethersafha binds, then
+# + opened the vani sink — the (⛔ unproven, see above) desktop ordering (aethersafha binds, then
 # spawn_path's puka). Because the server is already listening, a blocking
 # sock_connect #47 completes in-kernel (the loopback handshake lands in the
 # listener's accept queue without the server proc running); a client-spawns-server

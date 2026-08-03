@@ -2,7 +2,7 @@
 
 **मिश्रण — mixing / mixture**
 
-Version: 0.5.2
+Version: 0.5.3
 
 Sovereign software **audio mixer + routing daemon** for AGNOS, written in
 pure Cyrius. mishran is the multi-stream fan-in layer the agnostic audio
@@ -26,10 +26,22 @@ mishran talks to the device. That is the whole point of the mixer.
 
 **v0.4.x = a working mixer + routing server.** mishran fans many per-app
 S16 streams into one mixed writer to a real `vani` sink, with per-stream
-and master gain, linear resampling, and a TCP-loopback routing server so
-separate app processes can share the one hardware writer. Proven on agnos:
-a single-proc mixed tone (`mishtone`) and a **two-proc** client→loopback→
-mixer→vani→HDA tone (`mishduplex` + `mishclient`), both non-silent.
+and master gain, linear resampling, and a routing server so separate app
+processes can share the one hardware writer. Proven on agnos: a
+**single-proc** mixed tone (`mishtone`) — an honest test, no rigging.
+
+> ⛔ **The two-proc claim is RETRACTED (2026-08-03).** This paragraph used to
+> also claim a proven "**two-proc** client→loopback→mixer→vani→HDA tone
+> (`mishduplex` + `mishclient`)". That was a **FALSE GREEN**: the only proof,
+> `mishran-duplex-audio-smoke.sh`, ran under a `MISHRAN_DUPLEX_SELFTEST` kernel
+> hook that assigned `net_ip = 0x7F000001`; agnos puts `net_ip` in an outbound
+> SYN's SOURCE, so on an ordinary boot the client's loopback connect could never
+> match a 4-tuple and the two procs could not talk at all. Hook and smoke are
+> **deleted**. **TCP-on-loopback is not the local IPC transport** — the
+> replacement is the agnos socket (`naadi`), agnos
+> `docs/development/planning/ipc.md` §9-§10. The routing server, the client API
+> and the cooperative-yield pump are unaffected as *code*; they need re-targeting
+> onto `naadi` and re-proving there. Do not re-add the hook under any name.
 
 - `src/error.cyr` — `MishranErr` codes + `mishran_err_*` helpers.
 - `src/stream.cyr` — `MshStream`: id, `MshFormat` (S16/F32), sample rate,

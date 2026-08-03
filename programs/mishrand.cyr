@@ -1,5 +1,17 @@
 # programs/mishrand.cyr — the mishran mixing DAEMON (the runnable server).
 #
+# ⛔⛔ THE TRANSPORT THIS DAEMON LISTENS ON IS RETIRED (2026-08-03). TCP-on-loopback is NOT
+# the local IPC transport — operator ruling. The replacement is the agnos socket (`naadi`,
+# agnos `docs/development/planning/ipc.md` §9). Read the loopback:7701 wiring below as the
+# SHAPE to re-target, not as the shipping design. The related `MISHRAN_DUPLEX_SELFTEST`
+# kernel hook (which assigned `net_ip = 0x7F000001` so a loopback connect could match a
+# 4-tuple on agnos at all) and its smoke are DELETED, and every agnos two-proc green they
+# produced is retracted — see the notice atop CHANGELOG.md and ipc.md §10. Note the split:
+# the MIXING half of this daemon (router, streams, gains, `msh_router_pump_nb` cooperative
+# pacing to the vani sink) is sound and untouched by the retraction; only the wire it
+# accepts clients over is dead. `serve_probe` below is a HOST (Linux) probe and remains
+# honest — Linux loopback works; agnos was the rigged case.
+#
 # Opens the single vani sink, listens for app clients on loopback:7701, and runs
 # the real-time loop: service each client (drain its PCM into its stream ring) +
 # pump the mixed block to the sink. `audio_write` inside the pump blocks until the

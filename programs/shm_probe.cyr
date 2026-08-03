@@ -7,8 +7,13 @@
 #   C. backpressure: when the ring can't hold a block the server LATCHES it (pending
 #      frames + shm buf id, no ACK); draining the ring + re-polling runs the
 #      pending-retry (shm_read + ring write + ACK). Verified by slot inspection.
-# Exit 0 = PASS. Host-only (the agnos two-proc form is validated in QEMU by
-# scripts/mishran-duplex-audio-smoke.sh).
+# Exit 0 = PASS. Host-only.
+# ⛔ 2026-08-03: this header used to point at `agnos scripts/mishran-duplex-audio-smoke.sh` as the
+# agnos two-proc validation. That smoke was a FALSE GREEN — it needed the MISHRAN_DUPLEX_SELFTEST
+# kernel hook's `net_ip = 0x7F000001` assignment for its loopback connect to complete at all — and
+# both the hook and the script have been DELETED. There is currently NO valid agnos two-proc
+# validation of this path; it must be re-proven over the agnos socket (`naadi`). Do not go looking
+# for that script. See agnos docs/development/planning/ipc.md §9-§10.
 
 include "src/lib.cyr"
 

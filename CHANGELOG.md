@@ -5,6 +5,43 @@ All notable changes to **mishran** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> ⛔ **RETRACTION NOTICE — 2026-08-03. Every "validated on agnos" claim in this file that cites
+> `mishran-duplex-audio-smoke.sh` is a FALSE GREEN.** That smoke built its kernel with the
+> `MISHRAN_DUPLEX_SELFTEST` hook, which assigned `net_ip = 0x7F000001` in the kernel before
+> launching the peer. agnos puts `net_ip` in an outbound SYN's SOURCE, so a client dialling
+> `127.0.0.1` normally gets a SYN-ACK that `tcp_find_conn` can never match; the hook forced
+> src == dst so the handshake closed **only under the hook**. On an ordinary boot mishran's
+> two-proc loopback path could not connect at all. The hook, its `build.sh` define and the
+> smoke script were all **deleted 2026-08-03**. TCP-on-loopback is not the local IPC transport —
+> the replacement is the agnos socket (`naadi`), agnos `docs/development/planning/ipc.md` §9-§10.
+> Individual claims below carry inline markers. History is preserved deliberately; do not cite it
+> as proof, and do not re-add the hook under any name.
+
+## [0.5.3] - 2026-08-02
+
+### Changed — cyrius pin 6.4.61 -> 6.5.5
+
+Toolchain catch-up across the whole desktop stack, cut together so the next burn runs binaries built
+by ONE compiler rather than 6 different ones.
+
+⚠ **The pin was documentation, not enforcement.** `cyrius build` compiles with the INSTALLED `cycc`,
+prints a `toolchain drift` warning, and carries on — so this project was already being built by 6.5.5
+before this bump. Verify provenance with `~/.cyrius/versions/<pin>/bin/cyrius` when it matters.
+
+⭐ What the gap actually contained, for a reader deciding whether to care:
+- **6.5.1** made overload-suffix arity a hard **error** where it used to warn. Latent arity
+  mismatches are now build failures instead of silently-wrong code — good, and the reason this
+  sweep surfaced real defects elsewhere in the stack.
+- **6.4.75** fixed `fn_table` growth past 8192 silently corrupting six fn-indexed side tables.
+- **6.5.0** added file-scoped `private` / per-item `public` — the first real answer to this
+  ecosystem's duplicate-`fn`-silently-shadows hazard.
+- **6.4.82** completed the agnos GPU syscall wrapper band to `#82`-`#95`, so `sys_gpu_shader_op`
+  (#92) and `sys_gpu_modeset_op` (#93) no longer need a raw `syscall()` behind an `#ifdef`.
+
+### Verification
+
+Host + `--agnos` builds green; `gain_probe`, `resample_probe`, `shm_probe`, `client_leak_probe` all pass; every program in `programs/` builds. ⚠ `mishclient`/`mishduplex` build `--agnos` only, and always did — they call `sys_sched_yield`, which is agnos-only; this is unchanged by the bump (verified against the old 6.4.61 pin).
+
 ## [0.5.2] - 2026-07-12 — repin to cyrius 6.4.61 (the daemon is now leak-free end-to-end)
 
 0.5.0/0.5.1 made mishran's own serving loop + client hot path alloc-free, but the
@@ -54,9 +91,13 @@ buffers.
   (`msh_client_write`, `msh_client_wait_ack`, and `msh_client_gain` / `_close`) now
   allocates **nothing** per block. A host leak probe (`programs/client_leak_probe.cyr`)
   measuring `alloc_used()` across **20 000 blocks**: `msh_client_write` growth **0 bytes**
-  in steady state, versus ~192 B/block before. Re-validated end-to-end on agnos
+  in steady state, versus ~192 B/block before. ~~Re-validated end-to-end on agnos
   (`mishran-duplex-audio-smoke.sh`: two concurrent procs, sustained tone to the DAC,
-  RMS 2229 / PEAK 4448, no deadlock/regression).
+  RMS 2229 / PEAK 4448, no deadlock/regression).~~
+  ⛔ **RETRACTED 2026-08-03 — this "re-validated on agnos" was a FALSE GREEN** produced by the
+  `MISHRAN_DUPLEX_SELFTEST` kernel hook's `net_ip = 0x7F000001` assignment (see the notice at the
+  top of this file). The **host** `client_leak_probe` result above stands; only the agnos leg is
+  void. TCP-on-loopback is retired as a local transport — agnos `planning/ipc.md` §10.
 
 ### Added
 
@@ -76,10 +117,18 @@ shared-memory buffer** — the audio counterpart of setu's framebuffer present. 
 tiny control message rides TCP; the samples travel through `sys_shm`. This lifts the
 old inline-`MSH_WRITE` block ceiling (256 frames / 1024 B, forced under the ~2 KB agnos
 loopback recv window): a client can now hand off blocks bounded by the shm buffer, not
-the window. Validated on agnos with 1024-frame (4096 B) blocks — larger than the whole
+the window. ~~Validated on agnos with 1024-frame (4096 B) blocks — larger than the whole
 TCP window — reaching the DAC (`mishran-duplex-audio-smoke.sh`, RMS 2269 / PEAK 4448, no
-deadlock). Pure userland; no kernel change (the `sys_shm_*` syscalls #71-74 already ship,
+deadlock).~~ Pure userland; no kernel change (the `sys_shm_*` syscalls #71-74 already ship,
 the same ones setu's present uses).
+
+> ⛔ **RETRACTED 2026-08-03 — the agnos validation above was a FALSE GREEN.**
+> `mishran-duplex-audio-smoke.sh` passed only because the `MISHRAN_DUPLEX_SELFTEST` kernel hook
+> assigned `net_ip = 0x7F000001`; without it the two procs could not complete a loopback
+> handshake at all, so nothing was proven about block ceilings on agnos. Note also that "only a
+> tiny control message rides TCP" is **not** the design going forward: local control messages
+> move to the agnos socket (`naadi`). The shm PCM payload path is unaffected by this retraction.
+> See agnos `docs/development/planning/ipc.md` §9-§10.
 
 This cut also **closes the serving-loop heap leak** the shm bite's adversarial-verify
 pass surfaced (the `### Known` item that was pending): the routing server no longer
@@ -141,9 +190,12 @@ allocates in its per-poll / per-block hot path, so a genuinely long-running mixe
   **0 bytes in steady state** (a one-time 1 KB scratch warmup), versus ~1.2 KB/block
   (≈ 24 MB) before. Deliberately **no per-tick `alloc_reset`**: `HELLO` allocates persistent
   stream/ring state (`msh_stream_new`) inside the loop, which a blanket reset would
-  reclaim out from under live streams. Re-validated end-to-end on agnos
+  reclaim out from under live streams. ~~Re-validated end-to-end on agnos
   (`mishran-duplex-audio-smoke.sh`, incl. a ~10 s long-run variant, sustained tone to the
-  DAC, no deadlock/OOM).
+  DAC, no deadlock/OOM).~~
+  ⛔ **RETRACTED 2026-08-03 — FALSE GREEN** (`MISHRAN_DUPLEX_SELFTEST` `net_ip = 0x7F000001`
+  rigging; see the notice at the top of this file). The 20 000-block **host** leak measurement
+  above stands — only the agnos long-run leg is void.
 - **Orphaned client shm buffer on abnormal client drop.** A client that vanished without a
   `BYE` (crash) left its one out-of-band shm buffer unreclaimed for the daemon's lifetime.
   Low-severity on Linux (a stray tmpfs file), but a real hazard on agnos, whose kernel has
@@ -153,7 +205,18 @@ allocates in its per-poll / per-block hot path, so a genuinely long-running mixe
   it first so the client's own `msh_client_close` free stays authoritative (avoids a
   double-free that could hit a since-reused slot id).
 
-## [0.4.1] - 2026-07-10 — two-proc audio on agnos (cooperative yield)
+## [0.4.1] - 2026-07-10 — two-proc audio on agnos (cooperative yield) ⛔ agnos claim RETRACTED
+
+> ⛔ **RETRACTED 2026-08-03 — the headline claim of this version is a FALSE GREEN.** "Two
+> concurrent processes share the hardware writer **on agnos**" was demonstrated exclusively by
+> `mishran-duplex-audio-smoke.sh` under the `MISHRAN_DUPLEX_SELFTEST` kernel hook, which assigned
+> `net_ip = 0x7F000001` so the client's loopback connect could match a 4-tuple it otherwise never
+> could. Hook, define and smoke were deleted 2026-08-03. What **survives**: the cooperative-yield
+> mechanism itself (`msh_router_pump_nb`, the `sched_yield` backoffs) is sound engineering and is
+> unchanged — it simply has no valid agnos demonstration and must be re-proven over the agnos
+> socket (`naadi`). What **dies**: the TCP-loopback wire as mishran's local transport, and the
+> sub-window chunking workaround built to accommodate it. See agnos
+> `docs/development/planning/ipc.md` §9-§10 and `planning/blocking-syscall-concurrency.md`.
 
 Two concurrent processes can now share the one hardware writer through the mixer on
 agnos — an app streams to the daemon over the loopback wire while the daemon mixes to
@@ -192,14 +255,24 @@ agnos planning note `docs/development/planning/blocking-syscall-concurrency.md`.
   (client).** The mixer server binds loopback:7701 + opens the vani sink, then
   `spawn_path`'s the client (the desktop server-first ordering — bind before the client
   connects); the client streams a square-wave tone over the real TCP wire; the server
-  mixes it to vani. Driven on agnos by a `MISHRAN_DUPLEX_SELFTEST` kernel hook (agnos
+  mixes it to vani. ~~Driven on agnos by a `MISHRAN_DUPLEX_SELFTEST` kernel hook (agnos
   `kernel/core/main.cyr`, **post-`sched_active`** so two procs actually run concurrently)
   and captured by `agnos scripts/mishran-duplex-audio-smoke.sh`: **RMS 2116, PEAK 4448**
   (thresholds 800/3000), `hda: stream running`. PCM is chunked below the 2 KB agnos TCP
   loopback window (256 frames/write) + `sched_yield`-paced so `sock_send` #48 fits the
   recv buffer instead of blocking preempt-held — a wire constraint, not a mixer one (see
   Notes). Proves: two concurrent ring-3 procs, real loopback handshake, cooperative
-  mix-to-DAC, no deadlock, no starvation.
+  mix-to-DAC, no deadlock, no starvation.~~
+
+  ⛔ **RETRACTED 2026-08-03 — THIS PROOF PROVED THE HOOK, NOT THE PATH.** The
+  `MISHRAN_DUPLEX_SELFTEST` hook assigned `net_ip = 0x7F000001` in the kernel, which is the only
+  reason "real loopback handshake" ever closed; on an ordinary boot it could not. The hook, its
+  `build.sh` define and `mishran-duplex-audio-smoke.sh` are **deleted** — do not look for the
+  script and do not re-add the define under any name. The RMS/PEAK numbers are not evidence of a
+  working two-proc path on agnos. `mishduplex.cyr` / `mishclient.cyr` remain in `programs/` as
+  the shape to re-target onto the agnos socket (`naadi`); the sub-window chunking note above is
+  a retired accommodation to a transport that is itself retired. See agnos
+  `docs/development/planning/ipc.md` §9-§10.
 - **Agnos audio proof — the mixer plays on the sovereign kernel.** `programs/mishtone.cyr`
   opens the vani sink via an `MshRouter`, registers two app streams at different Q8 gains
   (440 Hz @ unity + 660 Hz @ -6 dB), and mixes them frame-by-frame down to the sink. Driven
