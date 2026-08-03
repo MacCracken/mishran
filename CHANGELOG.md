@@ -17,6 +17,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Individual claims below carry inline markers. History is preserved deliberately; do not cite it
 > as proof, and do not re-add the hook under any name.
 
+## [0.5.4] - 2026-08-03
+
+### Fixed — the transport retraction over-reached and claimed more than the evidence supports
+
+0.5.3 retired the loopback:7701 transport correctly, but its retraction text in `src/transport.cyr`,
+`README.md` and this file stated the handshake **"could never match"** / **"was FALSE for agnos"** as
+unbounded facts. Those absolutes are not supported, and `dist/mishran.cyr` ships them to consumers.
+
+**The corrected, scoped statement:**
+
+- **Before `net_src_for` (agnos 1.56.34)** the handshake could not close on an ordinary boot: every
+  outbound segment claimed `net_ip` as its source, so a SYN to 127.0.0.1 was answered on a 4-tuple the
+  client's own conn could not match. Every agnos green from that era came off the `MISHRAN_DUPLEX_SELFTEST`
+  kernel hook's `net_ip = 0x7F000001` assignment and **remains retracted** — the two-proc audio results
+  included.
+- **`net_src_for` fixed the source-selection mechanism**, and setu's equivalent path did connect un-rigged
+  afterwards (`aethersafha-clients-test.py`, `connected: 2, presented: 2`, QEMU `-smp 1`, 2026-08-02).
+  **mishran's own 7701 wire was never re-tested post-fix.** So the honest statement is that it was
+  **never honestly demonstrated on agnos** — not that it could not work. Neither claim should be made.
+- **The transport is retired as the WRONG PRIMITIVE for local IPC, not because it was broken.**
+  Replacement is the agnos socket (`naadi`), agnos `docs/development/planning/ipc.md` §9; the removal
+  inventory is §10 of the same doc.
+
+Changed: `src/transport.cyr` (file banner), `README.md`, this file, and `dist/mishran.cyr` regenerated
+from source. **No code change** — comments, docs and the regenerated bundle only.
+
 ## [0.5.3] - 2026-08-02
 
 ### Changed — cyrius pin 6.4.61 -> 6.5.5
