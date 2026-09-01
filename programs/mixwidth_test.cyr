@@ -1,0 +1,68 @@
+# mishran mixwidth_test — regression probe for the 0.5.6 mix-width repair.
+#
+# Guards two failure modes that shipped through 0.5.5, both caused by msh_mix taking
+# the mix width from stream slot 0's client-supplied channel count instead of the sink's:
+#   A. STALE HEAP: a MONO stream in slot 0 made msh_mix size `total` at half of what
+#      the pump had sized mixbuf, so the mixer wrote only the first half of every block
+#      and the DAC played uninitialised heap for the second half.
+#   B. UP-MIX: a mono stream must be broadcast to BOTH output channels, not left as
+#      interleaved mono in a stereo buffer (which plays at double pitch, one channel).
+include "src/lib.cyr"
+
+enum MwCfg { MW_FRAMES = 64; MW_POISON = 31337; }
+
+fn mw_say(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+fn main(): i64 {
+    var fails = 0;
+
+    # A mono stream, filled with a constant so every produced sample is identifiable.
+    var st = msh_stream_new(48000, 1);
+    if (st == 0) { mw_say("mixwidth_test: stream alloc FAILED\n"); return 1; }
+    var src = alloc(MW_FRAMES * 2);
+    var i = 0;
+    while (i < MW_FRAMES) { store16(src + i * 2, 1000); i = i + 1; }
+    msh_stream_write(st, src, MW_FRAMES);
+
+    var streams = alloc(8);
+    store64(streams + 0, st);
+
+    # Stereo sink buffer, pre-poisoned. Anything the mixer fails to write stays poison.
+    var total = MW_FRAMES * 2;
+    var out = alloc(total * 2);
+    i = 0;
+    while (i < total) { store16(out + i * 2, MW_POISON); i = i + 1; }
+
+    msh_mix(streams, 1, out, MW_FRAMES, 48000, 2);
+
+    # A: no sample anywhere in the stereo block may still be poison.
+    var poisoned = 0;
+    i = 0;
+    while (i < total) {
+        if (load16(out + i * 2) == MW_POISON) { poisoned = poisoned + 1; }
+        i = i + 1;
+    }
+    if (poisoned != 0) {
+        mw_say("  A: FAIL — stale-heap samples left in the mixed block\n");
+        fails = fails + 1;
+    } else { mw_say("  A: PASS (mono in slot 0 fills the whole stereo block)\n"); }
+
+    # B: mono must appear on BOTH channels of every frame, at unity gain.
+    var badup = 0;
+    var f = 0;
+    while (f < MW_FRAMES) {
+        var l = msh_sext_s16(load16(out + (f * 2 + 0) * 2));
+        var r = msh_sext_s16(load16(out + (f * 2 + 1) * 2));
+        if (l != 1000) { badup = badup + 1; }
+        if (r != 1000) { badup = badup + 1; }
+        f = f + 1;
+    }
+    if (badup != 0) {
+        mw_say("  B: FAIL — mono not broadcast to both channels at unity\n");
+        fails = fails + 1;
+    } else { mw_say("  B: PASS (mono broadcast to both channels at unity)\n"); }
+
+    if (fails == 0) { mw_say("mishran mixwidth_test: PASS\n"); return 0; }
+    mw_say("mishran mixwidth_test: FAIL\n");
+    return 1;
+}

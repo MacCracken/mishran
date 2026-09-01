@@ -31,9 +31,33 @@
 
 var MSH_TCP_PORT = 7701;   # mishran's well-known loopback audio-server port (setu = 7700)
 
+# Take SIGPIPE off the table for anything that opens a mishran socket.
+#
+# WHY THIS LIVES HERE and not in each program's main(): a mixer daemon writes to
+# client sockets it does not control (msh_srv_ack on every consumed block, the
+# WELCOME reply, MSH_ERR). The default disposition of SIGPIPE is TERMINATE, and the
+# cyrius runtime installs no prologue that changes it — so a client exiting NORMALLY,
+# with a block still unacked, kills the whole mixer and takes every OTHER app's audio
+# with it. Measured on host: a write to a pipe whose read end is closed exits 141
+# (128+13); with signal_ignore in place sys_write returns -EPIPE and the process
+# lives. Putting it in the transport means mishrand, mishduplex and every probe get
+# it by construction rather than by remembering.
+#
+# Idempotent and cheap (one rt_sigaction), so both entry points call it rather than
+# depending on which one a given program happens to use. A no-op on agnos/Windows,
+# which have no SIGPIPE — see lib/syscalls.cyr's signal_ignore.
+#
+# The guard only converts the KILL into an error return; the caller must then ACT on
+# that error. Every msh_write_all caller in server.cyr drops the slot on < 0.
+fn msh_sigpipe_guard(): i64 {
+    signal_ignore(SIGPIPE);
+    return 0;
+}
+
 # Connect to the mishran server (loopback : MSH_TCP_PORT). Returns the connected
 # fd (>= 0), or -2 (socket) / -3 (connect).
 fn msh_connect(): i64 {
+    msh_sigpipe_guard();
     var s = tcp_socket();
     if (is_ok(s) == 0) { return 0 - 2; }
     var fd = result_unwrap(s);
@@ -47,6 +71,7 @@ fn msh_connect(): i64 {
 # Bind + listen on the mishran endpoint. Returns the listening fd (>= 0), or
 # -2 (socket) / -3 (bind) / -4 (listen). Non-blocking so msh_accept polls.
 fn msh_listen(): i64 {
+    msh_sigpipe_guard();
     var s = tcp_socket();
     if (is_ok(s) == 0) { return 0 - 2; }
     var fd = result_unwrap(s);
@@ -115,48 +140,112 @@ fn msh_send(fd, m): i64 {
     return msh_send_buf(fd, m, alloc(MSH_MSG_SZ));
 }
 
-# Blocking read of >= 1 byte into `buf` (cap `cap`). Absorbs agnos's non-blocking
-# recv (0 = would-block → yield + bounded retry) vs Linux's blocking read
-# (0 = EOF). Returns bytes (> 0) or -6 on EOF / error / timeout.
-fn msh_read_blk(fd, buf, cap): i64 {
-    var tries = 0;
-    #ifdef CYRIUS_TARGET_AGNOS
-    # agnos: recv is non-blocking; DONATE the slice (sched_yield #44) so the peer runs
-    # to produce the bytes, then retry. Not sleep_ms — that holds preempt off and would
-    # keep the peer from ever running (agnos-blocking-syscall-yield-fix). The cap is a
-    # generous safety net against a silent-but-alive peer (a dead peer returns r<0 and
-    # breaks immediately); each yield is a full peer-slice, so this is far longer than
-    # the old 5000*2ms wall clock without falsely timing out a cooperative exchange.
-    while (tries <= 2000000) {
-        var r = sys_read(fd, buf, cap);
-        if (r < 0) { return 0 - 6; }               # -1 = EOF / error
-        if (r > 0) { return r; }                   # got bytes
-        tries = tries + 1;                          # r == 0 → would-block
-        sys_sched_yield();
-    }
-    return 0 - 6;
-    #endif
-    #ifndef CYRIUS_TARGET_AGNOS
-    while (tries <= 2000000) {                       # Linux: nonblocking fd → busy-spin on EAGAIN
-        var r = sys_read(fd, buf, cap);             # (loopback delivers in microseconds; bounded)
-        if (r == 0) { return 0 - 6; }              # 0 = EOF on Linux
-        if (r > 0) { return r; }                   # got bytes
-        tries = tries + 1;                          # r < 0 = EAGAIN
-    }
-    return 0 - 6;
-    #endif
+# ── Read budget (0.5.6) ──
+# ⚠ THIS IS A MITIGATION, NOT THE FIX. The real repair is a per-slot partial-message
+# state machine so msh_server_service never blocks at all; that is a restructuring of
+# the poll path and is filed for 0.6.0. What follows bounds the damage.
+#
+# What it bounds: msh_try_read_msg reads a 16-byte header non-blocking, but the moment
+# ONE byte arrives it finishes the frame with the BLOCKING msh_read_exact. A client
+# that sends 8 bytes and stops therefore parked the single-threaded daemon inside
+# msh_read_blk — which, on the host, re-issued read() on EAGAIN with no wait at all,
+# burning ~2 million syscalls on a pegged core while the pump never ran and ALL audio
+# stopped. Reachable from an un-HELLO'd socket with an 8-byte write.
+#
+# Two things were wrong and both are fixed here:
+#   1. No wait between retries — a pure spin. Now a short nanosleep, so a stalled peer
+#      costs idle time instead of a core.
+#   2. The budget was per-CALL, and msh_read_exact calls msh_read_blk afresh per chunk,
+#      so `tries` reset on EVERY byte received: a client dribbling one byte per timeout
+#      held the daemon forever. The budget is now threaded through msh_read_exact as a
+#      caller-owned cell, so it spans the whole logical message.
+#
+# MSH_READ_SPIN hot iterations first, because loopback normally delivers in
+# microseconds and sleeping there would cost real throughput.
+enum MshReadBudget {
+    MSH_READ_SPIN   = 64;        # hot retries before sleeping at all
+    MSH_READ_QUANTA = 4000;      # sleep quanta per message: 4000 * 250 us = ~1 s
+    MSH_READ_NAP_NS = 250000;    # 250 us
 }
 
-# Read EXACTLY `n` bytes into `buf`, looping over short/would-block reads. Returns
-# `n` (>= 0) or -6 on EOF/error.
-fn msh_read_exact(fd, buf, n): i64 {
+# Sleep one quantum. Host only — on agnos the caller donates its slice with
+# sched_yield instead, which is the correct primitive there (sleeping holds preempt
+# off and would stop the peer from ever running).
+fn _msh_nap(): i64 {
+    #ifndef CYRIUS_TARGET_AGNOS
+    var ts[16];
+    store64(&ts + 0, 0);
+    store64(&ts + 8, MSH_READ_NAP_NS);
+    syscall(35, &ts, 0);                            # nanosleep(&ts, 0)
+    #endif
+    return 0;
+}
+
+# Allocate a read budget cell (caller-owned, one per logical message). `budp` points
+# at a single i64 of remaining quanta.
+fn msh_budget_init(budp): i64 { store64(budp, MSH_READ_QUANTA); return 0; }
+
+# Blocking read of >= 1 byte into `buf` (cap `cap`), spending from the caller's budget
+# cell. Absorbs agnos's non-blocking recv (0 = would-block -> yield + retry) vs Linux's
+# blocking read (0 = EOF). Returns bytes (> 0), or -6 on EOF / error / budget exhausted.
+fn msh_read_blk_bud(fd, buf, cap, budp): i64 {
+    var spins = 0;
+    while (1 == 1) {
+        var r = sys_read(fd, buf, cap);
+        #ifdef CYRIUS_TARGET_AGNOS
+        if (r < 0) { return 0 - 6; }                # -1 = EOF / error
+        if (r > 0) { return r; }                    # got bytes
+        #endif
+        #ifndef CYRIUS_TARGET_AGNOS
+        if (r == 0) { return 0 - 6; }               # 0 = EOF on Linux
+        if (r > 0) { return r; }                    # got bytes  (r < 0 = EAGAIN)
+        #endif
+        if (spins < MSH_READ_SPIN) {
+            spins = spins + 1;
+            #ifdef CYRIUS_TARGET_AGNOS
+            sys_sched_yield();                      # DONATE the slice so the peer produces bytes
+            #endif
+        } else {
+            var left = load64(budp);
+            if (left <= 0) { return 0 - 6; }        # budget spent -> drop this peer
+            store64(budp, left - 1);
+            #ifdef CYRIUS_TARGET_AGNOS
+            sys_sched_yield();
+            #endif
+            #ifndef CYRIUS_TARGET_AGNOS
+            _msh_nap();
+            #endif
+        }
+    }
+    return 0 - 6;
+}
+
+# Backwards-compatible wrapper: one fresh budget for this call. Callers reading a
+# multi-chunk message must use msh_read_blk_bud with a shared cell instead.
+fn msh_read_blk(fd, buf, cap): i64 {
+    var bud[8];
+    msh_budget_init(&bud);
+    return msh_read_blk_bud(fd, buf, cap, &bud);
+}
+
+# Read EXACTLY `n` bytes into `buf`, spending from the caller's budget cell so the
+# whole message shares ONE deadline. Returns `n` (>= 0) or -6 on EOF/error/timeout.
+fn msh_read_exact_bud(fd, buf, n, budp): i64 {
+    if (n < 0) { return 0 - 6; }
     var got = 0;
     while (got < n) {
-        var r = msh_read_blk(fd, buf + got, n - got);
+        var r = msh_read_blk_bud(fd, buf + got, n - got, budp);
         if (r <= 0) { return 0 - 6; }
         got = got + r;
     }
     return got;
+}
+
+# Backwards-compatible wrapper with its own budget.
+fn msh_read_exact(fd, buf, n): i64 {
+    var bud[8];
+    msh_budget_init(&bud);
+    return msh_read_exact_bud(fd, buf, n, &bud);
 }
 
 # Blocking read of ONE length-framed message into `m` (header gives argc → total
@@ -164,13 +253,15 @@ fn msh_read_exact(fd, buf, n): i64 {
 # ALLOC-FREE, the read mirror of msh_send_buf for the client's per-ACK wait loop.
 # Returns the frame length (> 0), -6 on EOF/short read, or -1 on a bad frame.
 fn msh_read_msg_buf(fd, m, buf): i64 {
-    if (msh_read_exact(fd, buf, 16) < 0) { return 0 - 6; }
+    var bud[8];
+    msh_budget_init(&bud);                          # ONE budget for the whole frame
+    if (msh_read_exact_bud(fd, buf, 16, &bud) < 0) { return 0 - 6; }
     var argc = load64(buf + 8);
     if (argc < 0) { return 0 - 1; }
     if (argc > MSH_MAX_ARGS) { return 0 - 1; }
     var total = (2 + argc) * 8;
     if (total > 16) {
-        if (msh_read_exact(fd, buf + 16, total - 16) < 0) { return 0 - 6; }
+        if (msh_read_exact_bud(fd, buf + 16, total - 16, &bud) < 0) { return 0 - 6; }
     }
     return msh_decode(buf, total, m);
 }
@@ -198,12 +289,16 @@ fn msh_try_read_msg(fd, m, buf): i64 {
     if (r < 0)  { return 0; }                      # EAGAIN on a nonblocking fd → nothing pending
     if (r == 0) { return 0 - 1; }                  # EOF on Linux
     #endif
-    if (r < 16) { if (msh_read_exact(fd, buf + r, 16 - r) < 0) { return 0 - 1; } }
+    # From here the frame is finished with BLOCKING reads, all sharing one budget so a
+    # peer that stops mid-frame costs a bounded stall rather than pinning the daemon.
+    var bud[8];
+    msh_budget_init(&bud);
+    if (r < 16) { if (msh_read_exact_bud(fd, buf + r, 16 - r, &bud) < 0) { return 0 - 1; } }
     var argc = load64(buf + 8);
     if (argc < 0) { return 0 - 1; }
     if (argc > MSH_MAX_ARGS) { return 0 - 1; }
     var total = (2 + argc) * 8;
-    if (total > 16) { if (msh_read_exact(fd, buf + 16, total - 16) < 0) { return 0 - 1; } }
+    if (total > 16) { if (msh_read_exact_bud(fd, buf + 16, total - 16, &bud) < 0) { return 0 - 1; } }
     if (msh_decode(buf, total, m) < 0) { return 0 - 1; }
     return 1;
 }

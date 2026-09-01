@@ -1,0 +1,43 @@
+# mishran readbudget_test — regression test for the 0.5.6 read-budget mitigation.
+#
+# Through 0.5.5 a peer that sent PART of a message and then stopped parked the
+# single-threaded daemon inside msh_read_blk. On the host that loop re-issued read()
+# on EAGAIN with NO wait, burning ~2 million syscalls on a pegged core while the pump
+# never ran — so every app's audio stopped. It was reachable from an un-HELLO'd socket
+# by writing 8 bytes of a 16-byte header and going quiet.
+#
+# This test reproduces exactly that shape on a non-blocking pipe: 8 bytes present, 8
+# bytes never coming, writer still open (so it is a STALL, not EOF). The property under
+# test is that msh_read_exact RETURNS an error within its budget instead of spinning
+# forever. If the budget regresses, this test hangs and the CI timeout kills it.
+include "src/lib.cyr"
+
+fn rb_say(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+fn main(): i64 {
+    var fds[16];
+    if (syscall(22, &fds) < 0) { rb_say("readbudget_test: pipe() FAILED\n"); return 1; }
+    var rd = load32(&fds + 0);
+    var wr = load32(&fds + 4);
+
+    # Non-blocking read end, so a short read reports EAGAIN — the same condition a
+    # non-blocking socket gives the server poll path.
+    syscall(72, rd, 4, 2048);                 # fcntl(rd, F_SETFL, O_NONBLOCK)
+
+    # Half a header, then silence. The writer stays OPEN: EOF would be an easy exit,
+    # and easy exits are not what pinned the daemon.
+    var half = alloc(8);
+    var i = 0;
+    while (i < 8) { store8(half + i, 65); i = i + 1; }
+    if (sys_write(wr, half, 8) != 8) { rb_say("readbudget_test: short setup write\n"); return 1; }
+
+    var buf = alloc(64);
+    var r = msh_read_exact(rd, buf, 16);      # wants 16, will only ever see 8
+
+    if (r >= 0) {
+        rb_say("readbudget_test: FAIL — claimed a full read that never arrived\n");
+        return 1;
+    }
+    rb_say("readbudget_test: PASS (partial message returns within budget, no spin)\n");
+    return 0;
+}

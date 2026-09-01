@@ -12,6 +12,13 @@
 # minus), so the minimum is expressed as `0 - 32768` inside the clamp.
 enum MshS16 {
     MSH_S16_MAX = 32767;
+    # Q8 gain ceiling (+24 dB). A gain is wire-supplied, and `sample * gain` is a
+    # plain i64 multiply evaluated BEFORE msh_clamp_s16 ever sees it — so a gain
+    # above roughly 2^48 wraps the product and the clamp then faithfully saturates
+    # an already-garbage value, often to the WRONG rail (a phase-inverted full-scale
+    # square wave rather than a loud one). Bounding the gain keeps the multiply in
+    # range; 4096 is +24 dB, far past any legitimate use.
+    MSH_MAX_GAIN_Q8 = 4096;
 }
 
 # Clamp an accumulated i64 sample into the signed-16-bit range.
@@ -68,17 +75,26 @@ fn msh_resample(src, src_frames, in_rate, out, out_cap, out_rate, ch): i64 {
 #   frames    — frame count to produce (at the sink rate)
 #   sink_rate — the router output rate; a stream at a different rate is
 #               linear-resampled to it via msh_resample before summing.
-# Channel count comes from the first stream (default stereo). Each stream is
-# scaled by its per-stream Q8 gain, summed sample-by-sample, and clamped.
-# Returns MISHRAN_OK.
-# TODO(v0.2): F32 path; reuse router-owned scratch instead of the per-call alloc.
-fn msh_mix(streams, n, out, frames, sink_rate): i64 {
-    var ch = 2;
-    if (n > 0) {
-        var s0 = load64(streams + 0);
-        if (s0 != 0) { ch = msh_stream_channels(s0); }
-    }
-    var total = frames * ch;
+#   sink_ch   — the OUTPUT channel count. This is a property of the SINK and the
+#               caller already knows it; msh_mix must never infer it.
+#
+# ⚠ SIGNATURE CHANGED IN 0.5.6 (added sink_ch). Before this, msh_mix took the mix
+# width from stream slot 0's client-supplied channel count while msh_router_pump had
+# already sized mixbuf from the SINK's. The two disagreed in both directions:
+#   - slot-0 NARROWER than the sink (a mono client, which jalwa produces by default):
+#     total was half of mixbuf, so the mixer wrote only the first half of every block
+#     and the DAC played whatever was in the second half — uninitialised heap.
+#   - slot-0 WIDER than another stream's: msh_stream_read writes at the STREAM's own
+#     width into a scratch sized from slot 0's, overrunning it by that ratio.
+# Each stream is scaled by its per-stream Q8 gain, up-mixed to the sink width if
+# narrower, summed, and clamped. A stream that cannot be read contributes silence
+# rather than failing the mixdown. Returns MISHRAN_OK, or MISHRAN_ERR_* only for a
+# fault of the MIX ITSELF (bad sink width, scratch OOM) — never for one stream.
+fn msh_mix_ws(streams, n, out, frames, sink_rate, sink_ch, scratch, inbuf, inbuf_frames): i64 {
+    if (sink_ch < 1) { return MISHRAN_ERR_FORMAT; }
+    if (frames < 1)  { return MISHRAN_OK; }
+    if (scratch == 0) { return MISHRAN_ERR_OOM; }
+    var total = frames * sink_ch;
 
     # Zero the accumulator (out doubles as the running sum in S16 space).
     var i = 0;
@@ -87,40 +103,90 @@ fn msh_mix(streams, n, out, frames, sink_rate): i64 {
         i = i + 1;
     }
 
-    var scratch = alloc(total * 2);
-    if (scratch == 0) { return MISHRAN_ERR_OOM; }
-
     var si = 0;
     while (si < n) {
         var s = load64(streams + si * 8);
         if (s != 0) {
-            var g = msh_stream_gain(s);              # Q8 per-stream volume (256 = unity)
-            var srate = msh_stream_rate(s);
-            var got_frames = 0;
-            if (srate == sink_rate) {
-                got_frames = msh_stream_read(s, scratch, frames);
-            } else {
-                # Pull the source frames that map to `frames` output frames, then
-                # linear-resample them up/down to the sink rate into scratch.
-                var in_frames = (frames * srate) / sink_rate;
-                if (in_frames < 1) { in_frames = 1; }
-                var inbuf = alloc(in_frames * ch * 2);
-                if (inbuf == 0) { return MISHRAN_ERR_OOM; }
-                var pulled = msh_stream_read(s, inbuf, in_frames);
-                got_frames = msh_resample(inbuf, pulled, srate, scratch, frames, sink_rate, ch);
-            }
-            var got_samples = got_frames * ch;
-            var k = 0;
-            while (k < got_samples) {
-                var acc = msh_sext_s16(load16(out + k * 2));
-                acc = acc + (msh_sext_s16(load16(scratch + k * 2)) * g) / 256;
-                store16(out + k * 2, msh_clamp_s16(acc));
-                k = k + 1;
+            var sch = msh_stream_channels(s);
+            # A stream WIDER than the sink cannot be represented in a buffer sized at
+            # the sink width, and mishran has no down-mix path — skip it rather than
+            # read it into a buffer sized for a narrower stride. The server refuses
+            # such a HELLO, so this is unreachable defence in depth.
+            if (sch >= 1) {
+                if (sch <= sink_ch) {
+                    var g = msh_stream_gain(s);              # Q8 per-stream volume (256 = unity)
+                    if (g < 0)         { g = 0; }
+                    if (g > MSH_MAX_GAIN_Q8) { g = MSH_MAX_GAIN_Q8; }
+                    var srate = msh_stream_rate(s);
+                    var got_frames = 0;
+                    var scap = frames * sch;                 # samples this stream may write
+                    if (srate == sink_rate) {
+                        got_frames = msh_stream_read_cap(s, scratch, frames, scap);
+                    } else {
+                        # Pull the source frames that map to `frames` output frames, then
+                        # linear-resample them up/down to the sink rate into scratch.
+                        var in_frames = (frames * srate) / sink_rate;
+                        if (in_frames < 1) { in_frames = 1; }
+                        # Never exceed the workspace the caller sized. inbuf_frames is the
+                        # worst case over the whole legal rate band (see msh_router_new), so
+                        # a clamp here should be unreachable — but a stream whose rate was
+                        # set by some path other than a validated HELLO must truncate, not
+                        # overrun. A per-stream shortfall costs that stream some frames this
+                        # tick; it never corrupts the workspace.
+                        if (in_frames > inbuf_frames) { in_frames = inbuf_frames; }
+                        # A per-stream failure must NOT abort the whole mixdown: before 0.5.6
+                        # an alloc failure here returned MISHRAN_ERR_OOM out of msh_mix, which
+                        # made the pump discard the block — so ONE stream's bad luck silenced
+                        # EVERY app. Skip this stream; the others still play.
+                        if (inbuf != 0) { if (in_frames >= 1) {
+                                var pulled = msh_stream_read_cap(s, inbuf, in_frames, in_frames * sch);
+                                got_frames = msh_resample(inbuf, pulled, srate, scratch, frames, sink_rate, sch);
+                            } }
+                    }
+                    # Accumulate at the SINK width, up-mixing a narrower stream. A mono
+                    # stream is broadcast to every output channel (source channel 0 for
+                    # all of them); an equal-width stream maps channel-for-channel. This
+                    # is why a mono client is ACCEPTED rather than refused: jalwa defaults
+                    # to channels=1 whenever a file carries no channel count, so refusing
+                    # mono would break the primary consumer.
+                    var o = 0;
+                    while (o < got_frames) {
+                        var c = 0;
+                        while (c < sink_ch) {
+                            var sc = c;
+                            if (sch == 1) { sc = 0; }
+                            var oidx = o * sink_ch + c;
+                            var sidx = o * sch + sc;
+                            var acc = msh_sext_s16(load16(out + oidx * 2));
+                            acc = acc + (msh_sext_s16(load16(scratch + sidx * 2)) * g) / 256;
+                            store16(out + oidx * 2, msh_clamp_s16(acc));
+                            c = c + 1;
+                        }
+                        o = o + 1;
+                    }
+                }
             }
         }
         si = si + 1;
     }
     return MISHRAN_OK;
+}
+
+# Allocating convenience wrapper over msh_mix_ws, for ONE-SHOT callers (probes, a
+# consumer mixing a single block) where a bump allocation never accumulates. The
+# per-tick audio path MUST use msh_mix_ws with router-owned buffers instead — mirrors
+# msh_send / msh_send_buf and msh_stream_read / msh_stream_read_cap.
+fn msh_mix(streams, n, out, frames, sink_rate, sink_ch): i64 {
+    if (sink_ch < 1) { return MISHRAN_ERR_FORMAT; }
+    if (frames < 1)  { return MISHRAN_OK; }
+    var scratch = alloc(frames * sink_ch * 2);
+    if (scratch == 0) { return MISHRAN_ERR_OOM; }
+    # Worst-case resample pull across the legal rate band, same bound msh_router_new uses.
+    var inf = (frames * MSH_MAX_RATE) / sink_rate;
+    if (inf < 1) { inf = 1; }
+    var inbuf = alloc(inf * sink_ch * 2);
+    if (inbuf == 0) { return MISHRAN_ERR_OOM; }
+    return msh_mix_ws(streams, n, out, frames, sink_rate, sink_ch, scratch, inbuf, inf);
 }
 
 # Scale `count` interleaved S16 samples in `buf` by a Q8 gain (256 = unity,

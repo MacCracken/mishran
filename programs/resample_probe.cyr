@@ -37,7 +37,7 @@ fn main(): i64 {
     msh_stream_write(st, tone, 4);
     var streams = alloc(1 * 8); store64(streams + 0, st);
     var mixout = alloc(8 * 2);
-    msh_mix(streams, 1, mixout, 8, 48000);
+    msh_mix(streams, 1, mixout, 8, 48000, 1);
     if (rp_s(mixout, 0) != 1000) { fails = fails + 1; }
     if (rp_s(mixout, 7) != 1000) { fails = fails + 1; }
 

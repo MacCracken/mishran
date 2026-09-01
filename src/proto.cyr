@@ -81,5 +81,13 @@ fn msh_decode(buf, n, m): i64 {
     store64(m + 8, argc);
     var i = 0;
     while (i < argc) { store64(m + 16 + i * 8, load64(buf + 16 + i * 8)); i = i + 1; }
+    # ZERO the arg words this message did not carry. The server decodes every client
+    # into ONE reused MshMsg, so without this a short frame INHERITS the previous
+    # message's argument values — possibly from a different client. A 16-byte HELLO
+    # (argc=0) would be built from whatever rate/channels the last decode left behind.
+    # Zeroing here fixes it for every caller at once; the dispatch sites additionally
+    # require the exact arity per opcode, so a short frame is refused rather than
+    # silently read as zeros.
+    while (i < MSH_MAX_ARGS) { store64(m + 16 + i * 8, 0); i = i + 1; }
     return total;
 }

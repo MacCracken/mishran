@@ -25,7 +25,7 @@ enum MshRouterCap {
 }
 
 # ----------------------------------------------------------------
-# MshRouter struct layout (56 bytes):
+# MshRouter struct layout (80 bytes):
 #   +0:  sink       — vani sink handle (0 = no sink open yet)
 #   +8:  streams    — ptr to array of MSH_MAX_STREAMS stream ptrs (8 each)
 #   +16: count      — number of registered streams
@@ -33,12 +33,39 @@ enum MshRouterCap {
 #   +32: channels   — sink channel count (default 2, stereo)
 #   +40: rate       — sink sample rate (default 48000)
 #   +48: master     — master output volume, Q8 (256 = unity, 0 = mute)
+#   +56: mixbuf     — router-owned mixdown buffer  (MSH_PUMP_FRAMES * ch samples)
+#   +64: mixscratch — router-owned per-stream pull (MSH_PUMP_FRAMES * ch samples)
+#   +72: inbuf      — router-owned resample pull   (_msh_inbuf_frames() * ch samples)
+#
+# ⚠ GREW FROM 56 TO 80 BYTES IN 0.5.6. The last three are the repair for the pump's
+# per-tick allocation: mixbuf came from an alloc() inside msh_router_pump and the other
+# two from allocs inside msh_mix, on every tick, against a stdlib allocator that has NO
+# free(). At MSH_PUMP_FRAMES=1024 and 48 kHz that is ~47 permanently-retained buffers a
+# second — the daemon grew without bound for as long as it played audio. They are now
+# allocated ONCE here and reused, which is the same discipline msh_server_new already
+# applied to the serving half. Nothing outside this file should depend on the layout:
+# every field is reached through an accessor, and the in-tree consumers (jalwa included)
+# only ever call the msh_router_* API.
 # ----------------------------------------------------------------
+
+# Worst-case resample pull, in FRAMES, for one pump tick at `sink_rate`.
+#
+# msh_mix pulls (frames * stream_rate) / sink_rate source frames to produce `frames`
+# output frames, so the largest pull comes from the highest stream rate the server
+# will accept — MSH_MAX_RATE, enforced at HELLO (see stream.cyr's MshFormatBounds).
+# That validation is what makes this bound STATIC and therefore pre-allocatable; if
+# the accepted rate band ever widens, this grows with it automatically.
+fn _msh_inbuf_frames(sink_rate): i64 {
+    if (sink_rate < 1) { return MSH_PUMP_FRAMES; }
+    var f = (MSH_PUMP_FRAMES * MSH_MAX_RATE) / sink_rate;
+    if (f < MSH_PUMP_FRAMES) { f = MSH_PUMP_FRAMES; }
+    return f;
+}
 
 # Allocate a router with an empty stream table and no sink.
 # Returns a MshRouter ptr, or 0 on allocation failure.
 fn msh_router_new(): i64 {
-    var r = alloc(56);
+    var r = alloc(80);
     if (r == 0) { return 0; }
     var tbl = alloc(MSH_MAX_STREAMS * 8);
     if (tbl == 0) { return 0; }
@@ -54,6 +81,22 @@ fn msh_router_new(): i64 {
     store64(r + 32, 2);          # channels — stereo
     store64(r + 40, 48000);      # rate
     store64(r + 48, 256);        # master output gain — Q8 unity
+
+    # The pump's whole working set, allocated ONCE. Sized from the router's own
+    # geometry (set just above) and from the HELLO-enforced rate ceiling, so no wire
+    # value can ever demand a bigger one — that is what makes pre-allocation sound.
+    # Three DISTINCT allocations rather than one carved block: an overrun of any of
+    # them must not silently land in a live neighbour.
+    var blk = MSH_PUMP_FRAMES * 2 * 2;                       # frames * stereo * 2 B
+    var mixbuf = alloc(blk);
+    if (mixbuf == 0) { return 0; }
+    var mixscratch = alloc(blk);
+    if (mixscratch == 0) { return 0; }
+    var inbuf = alloc(_msh_inbuf_frames(48000) * 2 * 2);
+    if (inbuf == 0) { return 0; }
+    store64(r + 56, mixbuf);
+    store64(r + 64, mixscratch);
+    store64(r + 72, inbuf);
     return r;
 }
 
@@ -90,10 +133,21 @@ fn msh_router_open(r, card, device): i64 {
     return MISHRAN_OK;
 }
 
-# Register a stream. Assigns it the next id, stores it in the first free
-# slot, bumps count. Returns the assigned stream id, or MISHRAN_ERR_OOM if
-# the table is full.
+# Register a stream. Assigns it the next id, stores it in the first free slot,
+# bumps count. Returns the assigned stream id (ALWAYS >= 1), or a NEGATIVE error.
+#
+# ⚠ RETURN CONTRACT CHANGED IN 0.5.6. This used to return `MISHRAN_ERR_OOM` on a
+# full table — and MISHRAN_ERR_OOM is literally 1, while next_id starts at 1, so
+# "table full" was BIT-IDENTICAL to "here is your stream, id 1". A caller could not
+# tell the two apart, and server.cyr duly sent that 1 back as a WELCOME id. Failure
+# is now negative so `id < 0` is a reliable test. Callers testing the old
+# `id == MISHRAN_ERR_OOM` must move to `id < 0`; in-tree callers ignore the return.
+#
+# The stream == 0 guard is defence in depth: msh_stream_set_id would store64 through
+# a null pointer (measured: SIGSEGV), and the only way to get here with 0 was an
+# unchecked msh_stream_new — which server.cyr now checks too.
 fn msh_router_add(r, stream): i64 {
+    if (stream == 0) { return 0 - MISHRAN_ERR_NO_STREAM; }
     var tbl = load64(r + 8);
     var i = 0;
     while (i < MSH_MAX_STREAMS) {
@@ -107,7 +161,7 @@ fn msh_router_add(r, stream): i64 {
         }
         i = i + 1;
     }
-    return MISHRAN_ERR_OOM;
+    return 0 - MISHRAN_ERR_OOM;
 }
 
 # Remove a stream by id. Returns MISHRAN_OK, or MISHRAN_ERR_NO_STREAM if the
@@ -129,8 +183,30 @@ fn msh_router_remove(r, id): i64 {
     return MISHRAN_ERR_NO_STREAM;
 }
 
-# One pump tick: pull MSH_PUMP_FRAMES from every registered stream, mix them
-# down via msh_mix, and push the mixed block to the vani sink. The sink must
+# Mix ONE block into the router's own mixbuf and apply the master level — everything
+# a pump tick does EXCEPT touching the device. Both pumps go through this, so they
+# cannot drift apart, and it is the seam that makes the mix stage testable on a host
+# with no audio hardware (programs/pumpleak_test.cyr drives exactly this).
+#
+# ALLOCATION-FREE by construction: every buffer it needs is router-owned and was
+# allocated once in msh_router_new. Do not reintroduce an alloc here — see the struct
+# layout note above for what that cost before 0.5.6.
+# Returns MISHRAN_OK, or an error from the mix itself.
+fn msh_router_mixtick(r): i64 {
+    var ch = load64(r + 32);
+    if (ch < 1) { return MISHRAN_ERR_FORMAT; }
+    var total = MSH_PUMP_FRAMES * ch;
+    var rc = msh_mix_ws(load64(r + 8), MSH_MAX_STREAMS, load64(r + 56),
+      MSH_PUMP_FRAMES, load64(r + 40), ch,
+      load64(r + 64), load64(r + 72),
+      _msh_inbuf_frames(load64(r + 40)));
+    if (rc != MISHRAN_OK) { return rc; }
+    # Apply the master output level to the mixed block (Q8; no-op at unity).
+    msh_apply_gain(load64(r + 56), total, load64(r + 48));
+    return MISHRAN_OK;
+}
+
+# One pump tick: mix a block (msh_router_mixtick) and push it to the vani sink. The sink must
 # already be open (msh_router_open); a router with no sink returns
 # MISHRAN_ERR_NO_SINK so the caller knows the block was mixed but not emitted.
 # Returns MISHRAN_OK on a clean mix + write, or an error code.
@@ -145,15 +221,9 @@ fn msh_router_remove(r, id): i64 {
 fn msh_router_pump(r): i64 {
     var ch = load64(r + 32);
     var total = MSH_PUMP_FRAMES * ch;
-    var mixbuf = alloc(total * 2);
-    if (mixbuf == 0) { return MISHRAN_ERR_OOM; }
-
-    var streams = load64(r + 8);
-    var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES, load64(r + 40));
+    var rc = msh_router_mixtick(r);
     if (rc != MISHRAN_OK) { return rc; }
-
-    # Apply the master output level to the mixed block (Q8; no-op at unity).
-    msh_apply_gain(mixbuf, total, load64(r + 48));
+    var mixbuf = load64(r + 56);
 
     # Push the mixed block to the vani sink. audio_write returns the frame count
     # ACCEPTED — which may be SHORT of what we asked for — or negative on error;
@@ -210,14 +280,9 @@ fn msh_router_pump_nb(r): i64 {
     var sink = load64(r + 0);
     if (sink == 0) { return MISHRAN_ERR_NO_SINK; }
     if (audio_avail(sink) < MSH_PUMP_FRAMES) { return MISHRAN_OK; }   # no room yet -> next tick
-    var ch = load64(r + 32);
-    var total = MSH_PUMP_FRAMES * ch;
-    var mixbuf = alloc(total * 2);
-    if (mixbuf == 0) { return MISHRAN_ERR_OOM; }
-    var streams = load64(r + 8);
-    var rc = msh_mix(streams, MSH_MAX_STREAMS, mixbuf, MSH_PUMP_FRAMES, load64(r + 40));
+    var rc = msh_router_mixtick(r);
     if (rc != MISHRAN_OK) { return rc; }
-    msh_apply_gain(mixbuf, total, load64(r + 48));            # master level (Q8; no-op at unity)
+    var mixbuf = load64(r + 56);
     var wn = audio_write_nb(sink, mixbuf, MSH_PUMP_FRAMES);   # room was checked -> full block fits
     if (wn < 0) { return MISHRAN_ERR_SINK_WRITE; }
     # A SHORT write here is anomalous — audio_avail said a whole block fit, and the

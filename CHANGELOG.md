@@ -95,6 +95,198 @@ kind), `cyrius fmt src/route.cyr --check` (clean, no rewrite) and `cyrius distli
 `dist/mishran.cyr` and `dist/mishran.deps` regenerated and committed together; the sidecar's 14
 leaves are unchanged by this fix.
 
+## [0.5.6] - 2026-09-01
+
+A P-1 audit sweep of the whole codebase — memory safety, wire-protocol validation,
+arithmetic, concurrency, resource lifecycle, audio correctness, refactor and performance —
+and the repairs it justified. 51 raw findings collapsed to 18 distinct defects after
+adversarial verification; **9 are repaired here**, the rest are filed below.
+
+⚠ **Read this if you consume `dist/mishran.cyr`.** Three signatures changed and one struct
+grew. See "Consumer-visible changes" at the end of this entry.
+
+### Security — the wire is now validated. It was not before.
+
+Every field `msh_server_service` reads off the socket was attacker-controlled and
+**none of them were range-checked**. A malicious *or merely buggy* client process could:
+
+- **Crash the mixer with one 32-byte message.** `MSH_HELLO` passed `rate` and `channels`
+  straight into `msh_stream_new`. A negative channel count made `alloc(16384 * ch * 2)`
+  return 0 (`lib/alloc.cyr` rejects size <= 0), `msh_stream_new` returned 0 unchecked, and
+  the following `msh_router_add` stored an id through the null pointer. **Reproduced: exit
+  139, SIGSEGV.** Now `rate` must be 8000..192000 and `channels` 1..2, checked *before*
+  anything is allocated, and both `msh_stream_new` and `msh_router_add` are null-guarded.
+- **Lock every future app out of the mixer, permanently, with 32 messages on one socket.**
+  The `MSH_HELLO` branch was the only one with no state guard. A second HELLO built a
+  second stream and overwrote the slot pointer, orphaning the first in the router table
+  where no drop path could reach it — `msh_server_drop` only removes the id currently in
+  the slot. 32 HELLOs filled all `MSH_MAX_STREAMS` slots for the life of the daemon. A
+  re-HELLO is now refused with `MSH_ERR` and the client dropped.
+- **Reach a null/undersized PCM buffer via `nframes`.** `nframes * channels * 2` overflowed
+  i64 to a *negative* byte count, which sailed past the backpressure test (a negative is
+  never >= a positive free count) and hit `msh_server_pcm`, whose `capacity >= need` test
+  is satisfied by `0 >= negative` — so it returned the current scratch pointer *without
+  allocating*, which on the first call is the initial 0. Both `MSH_WRITE` and
+  `MSH_WRITE_SHM` now clamp `nframes` to 1..`MSH_SHM_BLOCK_FRAMES` **before the multiply**,
+  `msh_server_pcm` rejects a non-positive `need`, and its documented `0`-on-OOM return is
+  now checked at **all four** call sites (it was checked at none).
+- **Act on another client's shm buffer.** The server used whatever `buf_id` a client named:
+  it read that buffer into the caller's stream, ACKed it (releasing a credit its real owner
+  never spent), and on abnormal drop **unlinked it**, breaking the owner's next write with
+  ENOENT. The id is now **bound to the slot on first use** and a later mismatch is refused.
+  ⚠ Scoped honestly: on Linux these are mode-0600 tmpfs files under one uid, so this is a
+  confused-deputy robustness fix, **not a privilege boundary**. It matters more on agnos,
+  where ids index a *global* kernel table of only 16 slots.
+- **Inherit another client's arguments.** The server decodes every client into ONE reused
+  `MshMsg` and no branch checked `argc`, so a short frame read whatever the previous decode
+  left in the arg words. `msh_decode` now zero-fills unused args, and each opcode requires
+  its exact arity. An unknown opcode is refused instead of silently ignored.
+- **Pin the master gain.** `MSH_GAIN` was a bare `store64` of a wire value, and `sample * gain`
+  is a plain i64 multiply evaluated *before* the S16 clamp — so a gain past ~2^48 wrapped
+  and the clamp then saturated an already-garbage value, often to the **wrong rail**. Clamped
+  to 0..4096 (+24 dB) on ingest, and defensively inside `msh_mix`.
+
+### Fixed — a normally-exiting client killed the entire mixer (SIGPIPE)
+
+The daemon writes to client sockets it does not control (an ACK on every consumed block).
+SIGPIPE's default disposition is **terminate**, and the cyrius runtime installs no prologue
+that changes it — so **a client exiting normally with a block unacked killed the mixer and
+took every other app's audio with it.** Measured: a write to a pipe whose read end is closed
+exits 141 (128+13); with `signal_ignore(SIGPIPE)` the write returns -EPIPE and the process
+lives. The guard now lives in `msh_listen`/`msh_connect`, so every program gets it by
+construction rather than by remembering, and the write errors it exposes are acted on.
+
+### Fixed — 🔴 the mixer read streams at one channel width into a buffer sized at another
+
+The highest-agreement finding in the sweep (7 independent lenses). `msh_mix` took the mix
+width from **stream slot 0's client-supplied channel count** while `msh_router_pump` had
+already sized `mixbuf` from the **sink's**. They disagreed in both directions:
+
+- **Slot 0 narrower than the sink** — a mono client, which is jalwa's default whenever a
+  file carries no channel count: `total` was half of `mixbuf`, so the mixer wrote only the
+  first half of every block and **the DAC played uninitialised heap for the second half**.
+- **Slot 0 wider than another stream** — `msh_stream_read` writes at the *stream's* own
+  width into a scratch sized from slot 0's, **overrunning it by that ratio**.
+
+`msh_mix` now takes `sink_ch` explicitly — the width is a property of the sink and the
+caller already knows it. A narrower stream is **up-mixed** (mono broadcast to every output
+channel) rather than refused; `msh_stream_read_cap` lets a caller state its buffer's real
+capacity; and a per-stream failure now **skips that stream** instead of returning
+`MISHRAN_ERR_OOM` out of the whole mixdown, which previously let one stream's bad luck
+silence every app.
+
+⚠ **Mono is accepted, not rejected.** Refusing non-stereo was the safer-looking option and
+it is what the audit proposed. It was rejected on evidence: jalwa (`[deps.mishran]`,
+`src/playback/audio.cyr`) passes the decoded file's channel count straight through and
+**defaults to 1**, so refusing mono would break the primary consumer for a defect that is
+mishran's, not its.
+
+### Fixed — the audio hot loop leaked ~1.35 GB/hour
+
+`msh_router_pump` allocated `mixbuf` every tick and `msh_mix` allocated a scratch (and, for
+a rate-mismatched stream, an inbuf) on top of it — against a stdlib allocator that **has no
+`free()` at all**. Measured **8192 bytes per tick**; at `MSH_PUMP_FRAMES=1024` and 48 kHz
+that is ~47 permanently-retained buffers a second. **The daemon grew without bound for as
+long as it played audio.** Both files' own TODOs already called for this fix.
+
+All three buffers are now allocated **once** in `msh_router_new` and reused, the same
+discipline `msh_server_new` already applied to the serving half. The resample buffer's
+worst case is static *because* of the new HELLO rate validation — the two repairs depend on
+each other. A new `msh_router_mixtick` seam holds the mix+gain stage so it is testable
+without audio hardware.
+
+⚠ **Sequencing mattered and is worth recording.** The width bug (above) had to be fixed
+*first*. While the pump allocated fresh each tick, its overrun landed in virgin bump space
+and corrupted nothing; hoisting the buffers to long-lived storage first would have converted
+a garbage-audio bug into corruption of live objects.
+
+### Mitigated — a partial message pinned the daemon (NOT a full fix)
+
+`msh_try_read_msg` reads a 16-byte header non-blocking, but the moment one byte arrives it
+finishes the frame with the **blocking** `msh_read_exact`. On the host that loop re-issued
+`read()` on EAGAIN with **no wait at all**, and the retry budget was per-*call* while
+`msh_read_exact` calls it afresh per chunk — so the budget reset on every byte received.
+**8 bytes from an un-HELLO'd socket, then silence, pinned the single-threaded daemon on a
+pegged core while the pump never ran and all audio stopped.**
+
+Now: a short `nanosleep` after a hot-spin window, and a budget threaded through
+`msh_read_exact` so it spans the whole logical message. Measured on the same stall that
+previously burned ~2M syscalls at ~100% CPU: **1.27 s wall, 2% CPU**, then a clean drop.
+
+⚠ **This bounds the damage; it does not cure it.** An attacker can re-trigger it on each
+reconnect, so the daemon degrades from an indefinite hang to a repeatable stutter. The real
+fix is a per-slot partial-message state machine so the poll path never blocks — filed below.
+
+### Added — the CI test gate is no longer vacuous
+
+CI globbed `programs/*_test.cyr` and `tests/tcyr/*.tcyr`; **neither matched anything**, so
+the step exited 0 having run nothing (flagged in 0.5.5). Three real regression tests now
+match that glob, and each is **mutation-proven** — deliberately reintroducing the defect
+makes it fail:
+
+- `programs/mixwidth_test.cyr` — mono in slot 0 must fill the whole stereo block (no stale
+  heap) and be broadcast to both channels. Fails against the 0.5.5 width inference.
+- `programs/pumpleak_test.cyr` — 0 bytes of heap growth across 200 pump mix ticks. Fails
+  when a per-tick `alloc` is reintroduced.
+- `programs/readbudget_test.cyr` — a partial message must return within budget, not spin.
+
+### Verification
+
+Clean gate at pin 6.5.36: `cyrius lint` clean over `src/` + `programs/`; `cyrius fmt --check`
+clean; `cyrius vet` `0 untrusted, 0 missing`; `cyrius distlib --check` current; `CYRIUS_DCE=1`
+build green with a valid ELF. Every program builds host + `--agnos` (`mishclient`/`mishduplex`
+remain `--agnos`-only, unchanged since 0.5.3). An undefined-symbol sweep over every program x
+{host, agnos, aarch64, win} is clean apart from those two.
+
+RUN suites: `gain_probe`, `resample_probe`, `shm_probe`, `client_leak_probe`, `serve_probe`,
+plus the three new tests — **all PASS**.
+
+⚠ **What is NOT verified.** This host has no audio device, so `pump_probe`, `mishtone` and
+`mishrand` self-skip and **the entire sink-write path is unexercised**: `audio_write`'s
+short-write and XRUN handling, `audio_avail`'s real returns, and actual DAC pacing. The
+8192 B/tick leak figure is measured; the ~47 ticks/s and ~1.35 GB/hour that follow from it
+assume the DAC paces the loop as designed. **The agnos target is static-read only.** No
+protocol fuzzing was done — specific hostile values were tested, not a generated corpus.
+
+### Consumer-visible changes
+
+- `msh_mix` takes a new final `sink_ch` argument. The allocating form is unchanged
+  otherwise; the per-tick path should use the new `msh_mix_ws` workspace variant.
+- `msh_router_add` returns a **negative** error instead of `MISHRAN_ERR_OOM`. The old value
+  is literally `1` while `next_id` starts at `1`, so "table full" was bit-identical to
+  "here is stream id 1" — a caller could not tell them apart. Test `id < 0`.
+- `MshRouter` grew from **56 to 80 bytes** (three router-owned buffers). Every field is
+  reached through an accessor; only code that hand-allocated or introspected a router by
+  byte offset is affected. jalwa, the only in-tree consumer, uses the API and is unaffected.
+- `msh_stream_read` and `msh_read_exact` keep their signatures; `msh_stream_read_cap`,
+  `msh_read_exact_bud` and `msh_mix_ws` are additive.
+- Clients sending `rate` outside 8000..192000, `channels` outside 1..2, `nframes` outside
+  1..2048, a wrong `argc`, a second HELLO, or a shm id they did not bind are now **refused
+  and dropped** where they were previously served.
+
+### Filed, not fixed — the rest of the sweep
+
+- **P1 `nonblocking-slot-read-state-machine`** — the real cure for the read stall above.
+  Per-slot accumulation buffer, byte-offset/expected-length pair, resume path. 0.6.0.
+- **P2 `mix-clamp-per-stream-not-post-sum`** — fan-in accumulates in S16 and clamps after
+  *every* stream, so an in-range mix still clips and the output depends on connection order
+  (20000 + 20000 - 25000 yields 7767, not 15000). Needs a wide accumulator.
+- **P2 `resample-block-truncation-and-phase-reset`** — double integer truncation drops the
+  last output frame of every tick for 44.1 kHz sources and runs them ~0.085% slow; the phase
+  accumulator also resets per block. **This is jalwa's most common path.** Needs per-stream
+  resampler state.
+- **P2 `stream-never-reclaimed-on-drop`** — `msh_server_drop` reclaims fd, router slot and
+  shm buffer but never the `MshStream` or its ring. There is no `free()` to call: the fix is
+  a fixed pool of pre-allocated streams, not a missing call.
+- **P2 `mishrand-idle-spin-host`** — the daemon loop's only wait is a `sys_sched_yield` that
+  compiles out on the host, so an idle daemon with no client pins a core.
+- **P2 `pump-nb-swallows-avail-error`** — `audio_avail` returning -1 takes the "no room yet"
+  path forever, stalling the mix silently. agnos-only; cannot fire on the host.
+- **P2 `write-all-agnos-only-wouldblock`** — `msh_write_all` encodes only the agnos
+  would-block convention while both sibling read paths carry matched `#ifdef` pairs.
+- **P3 `resample-div-per-sample`** — two integer divides per output sample where a Q32 phase
+  step would do. ~0.15% of a core per resampling stream; no glitch today.
+
 ## [0.5.5] - 2026-08-31
 
 ### Changed — cyrius pin 6.5.5 -> 6.5.36

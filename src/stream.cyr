@@ -9,6 +9,27 @@
 # raw samples (S16 = 2 bytes/sample via store16/load16); cap/head/tail are
 # measured in SAMPLES so the frame math is `frames * channels`.
 
+# Accepted stream geometry. A HELLO outside these bounds is REFUSED rather than
+# turned into a stream, because every one of these values is attacker-controlled and
+# each one sizes a buffer or drives a loop downstream:
+#   rate     — msh_mix computes in_frames = (frames * rate) / sink_rate to size the
+#              resample pull. An unbounded rate makes that product enormous; the band
+#              is also what lets the router pre-size ONE resample buffer at startup
+#              instead of allocating per tick (see msh_router_new).
+#   channels — msh_stream_new sizes the ring as 16384 * ch samples, and msh_stream_read
+#              writes frames * ch samples into a buffer the mixer sized. A negative ch
+#              made alloc() return 0 and the following msh_router_add SIGSEGV.
+#
+# The band is deliberately WIDE (8 kHz telephony to 192 kHz studio) — it exists to make
+# the arithmetic boundable, not to express taste. MSH_MAX_CH is 2 because the sink is
+# stereo and mishran has exactly one conversion path: mono is UP-MIXED in msh_mix.
+enum MshFormatBounds {
+    MSH_MIN_RATE = 8000;
+    MSH_MAX_RATE = 192000;
+    MSH_MIN_CH   = 1;
+    MSH_MAX_CH   = 2;
+}
+
 # ----------------------------------------------------------------
 # MshFormat — sample encoding tag.
 # ----------------------------------------------------------------
@@ -124,16 +145,32 @@ fn msh_stream_write(s, buf, frames): i64 {
     return frames;
 }
 
-# Read up to `frames` interleaved frames from the ring into `out` (S16).
-# Returns the number of frames actually read (short if the ring underflows;
-# the caller/mixer treats missing frames as silence).
-fn msh_stream_read(s, out, frames): i64 {
+# Read up to `frames` interleaved frames from the ring into `out` (S16), writing
+# AT MOST `out_cap` samples. Returns frames actually read.
+#
+# The capacity argument is the whole point (added 0.5.6). msh_stream_read writes
+# `frames * channels` samples, where `channels` belongs to the STREAM — so a caller
+# that sized `out` from a DIFFERENT channel count overruns it, silently and by a
+# factor of that ratio. That is exactly what msh_mix did: it sized its scratch from
+# stream-slot-0's channel count and then read every other stream into it at that
+# stream's own width. A buffer's capacity is knowledge only the caller has, so the
+# caller must be able to state it.
+#
+# out_cap is in SAMPLES (frames * channels), matching cap/head/tail. A short return
+# because of out_cap is indistinguishable from a short return because the ring
+# underflowed — both mean "this is all you get"; the mixer treats the rest as silence.
+fn msh_stream_read_cap(s, out, frames, out_cap): i64 {
     var ch = load64(s + 24);
     var ring = load64(s + 32);
     var cap = load64(s + 40);
     var head = load64(s + 48);
     var tail = load64(s + 56);
+    if (ch < 1) { return 0; }
     var want = frames * ch;
+    # Round the cap DOWN to a whole frame — a partial frame would desync the
+    # interleave for every sample after it.
+    if (want > out_cap) { want = (out_cap / ch) * ch; }
+    if (want < 0) { return 0; }
     var i = 0;
     while (i < want) {
         if (tail == head) {
@@ -146,5 +183,14 @@ fn msh_stream_read(s, out, frames): i64 {
         i = i + 1;
     }
     store64(s + 56, tail);
-    return frames;
+    return i / ch;
+}
+
+# Backwards-compatible wrapper: read `frames` frames with no capacity bound. Kept so
+# the 0.5.5 signature stays valid for consumers of dist/mishran.cyr; every in-repo
+# caller that owns a sized buffer should prefer msh_stream_read_cap.
+fn msh_stream_read(s, out, frames): i64 {
+    var ch = load64(s + 24);
+    if (ch < 1) { return 0; }
+    return msh_stream_read_cap(s, out, frames, frames * ch);
 }

@@ -1,0 +1,51 @@
+# mishran pumpleak_test — regression test for the 0.5.6 per-tick allocation repair.
+#
+# Through 0.5.5 the audio hot loop allocated on EVERY pump tick — mixbuf in
+# msh_router_pump plus a scratch (and, for a rate-mismatched stream, an inbuf) inside
+# msh_mix — on a stdlib allocator that has NO free() at all. Every tick's buffers were
+# therefore permanently retained. At MSH_PUMP_FRAMES=1024 and 48 kHz that is ~47
+# ticks/s of pure leak, so a daemon playing audio grows without bound until it OOMs.
+#
+# This test drives the mix+gain stage of the pump (everything except the device write,
+# which needs hardware) for N ticks and asserts the heap does not grow across them.
+# It fails loudly against 0.5.5 and must keep passing.
+include "src/lib.cyr"
+
+enum PlCfg { PL_TICKS = 200; PL_FRAMES = 1024; PL_CH = 2; }
+
+fn pl_say(s) { syscall(1, 1, s, strlen(s)); return 0; }
+
+fn main(): i64 {
+    var r = msh_router_new();
+    if (r == 0) { pl_say("pumpleak_test: router alloc FAILED\n"); return 1; }
+    var st = msh_stream_new(48000, 2);
+    if (st == 0) { pl_say("pumpleak_test: stream alloc FAILED\n"); return 1; }
+    msh_router_add(r, st);
+
+    # A block of PCM to keep the ring non-empty so the mix does real work every tick.
+    var src = alloc(PL_FRAMES * PL_CH * 2);
+    var i = 0;
+    while (i < PL_FRAMES * PL_CH) { store16(src + i * 2, 1000); i = i + 1; }
+
+    # Warm-up tick: any ONE-TIME lazy allocation (heap init, the router's own reusable
+    # buffers) happens here, so it is not counted as growth below.
+    msh_stream_write(st, src, PL_FRAMES);
+    msh_router_mixtick(r);
+
+    var before = alloc_used();
+    var t = 0;
+    while (t < PL_TICKS) {
+        msh_stream_write(st, src, PL_FRAMES);
+        msh_router_mixtick(r);
+        t = t + 1;
+    }
+    var after = alloc_used();
+    var growth = after - before;
+
+    if (growth != 0) {
+        pl_say("pumpleak_test: FAIL — heap grew across steady-state pump ticks\n");
+        return 1;
+    }
+    pl_say("pumpleak_test: PASS (0 bytes growth across 200 pump mix ticks)\n");
+    return 0;
+}

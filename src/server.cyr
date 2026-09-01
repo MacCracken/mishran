@@ -71,6 +71,12 @@ fn msh_server_rbuf(s): i64   { return load64(s + 32); }
 # so this grows a bounded handful of times then never again — the copy-out stops
 # allocating per block. Returns 0 on OOM.
 fn msh_server_pcm(s, need): i64 {
+    # Reject a non-positive need EXPLICITLY. Without this the capacity test below is
+    # a trap: a stored capacity of 0 satisfies `0 >= need` for every need <= 0, so a
+    # negative byte count (from a wire frame count that overflowed the i64 multiply)
+    # returned the CURRENT scratch pointer without allocating — which on the very
+    # first call is the initial 0, i.e. NULL — and the caller then read PCM into it.
+    if (need <= 0) { return 0; }
     if (load64(s + 48) >= need) { return load64(s + 40); }
     var buf = alloc(need);
     if (buf == 0) { return 0; }
@@ -135,12 +141,33 @@ fn msh_server_drop(s, slot): i64 {
 # and corrupts the stack (measured). The element-typed form `var b: u64[3]` would be a
 # true 24 B, but a caller-owned buffer keeps this alloc-free AND stack-safe, mirroring
 # msh_try_read_msg's caller-provided wire buffer.
+# Reply MSH_ERR(code) on `fd` using the caller's scratch buffer, then report failure.
+# Same alloc-free, caller-owned-buffer discipline as msh_srv_ack. Returns -7 always,
+# so a dispatch branch can `return msh_srv_err(...)` — the caller drops the slot.
+fn msh_srv_err(fd, code, buf): i64 {
+    store64(buf + 0, MSH_ERR);
+    store64(buf + 8, 1);
+    store64(buf + 16, code);
+    msh_write_all(fd, buf, 24);
+    return 0 - 7;
+}
+
 fn msh_srv_ack(fd, buf_id, buf): i64 {
     store64(buf + 0, MSH_ACK);
     store64(buf + 8, 1);
     store64(buf + 16, buf_id);
     if (msh_write_all(fd, buf, 24) < 0) { return 0 - 7; }
     return 24;
+}
+
+# Refuse the current message with MSH_ERR(FORMAT) and drop the slot. Returns 0 so a
+# dispatch branch can `return msh_srv_err_drop(...)` in one line — these checks appear
+# on several branches and an early `return 0` that forgot the drop would leave a
+# misbehaving client connected and free to retry.
+fn msh_srv_err_drop(s, slot, fd): i64 {
+    msh_srv_err(fd, MISHRAN_ERR_FORMAT, msh_server_rbuf(s));
+    msh_server_drop(s, slot);
+    return 0;
 }
 
 # Service one client slot: read + dispatch one pending message (non-blocking).
@@ -165,15 +192,20 @@ fn msh_server_service(s, slot): i64 {
             # not the socket. Copy it out, feed the ring, then ACK — releasing the
             # client's single-buffer credit so it may write the next block.
             var ppcm = msh_server_pcm(s, pn);
+            if (ppcm == 0) { msh_server_drop(s, slot); return 0; }
             if (msh_shm_read(pshm, ppcm, pn) < 0) { msh_server_drop(s, slot); return 0; }
             msh_stream_write(stream, ppcm, pending);
             store64(slot + 16, 0);
             store64(slot + 24, 0);
-            msh_srv_ack(fd, pshm, msh_server_rbuf(s));
+            # Act on the ACK's write error. With SIGPIPE ignored (msh_sigpipe_guard) a
+            # dead peer no longer kills the daemon — it returns -7 here instead, and
+            # continuing to service a dead fd would just repeat the failure every tick.
+            if (msh_srv_ack(fd, pshm, msh_server_rbuf(s)) < 0) { msh_server_drop(s, slot); }
             return 0;
         }
         # legacy inline-deferred (MSH_WRITE): the bytes are still in the socket.
         var pbuf = msh_server_pcm(s, pn);
+        if (pbuf == 0) { msh_server_drop(s, slot); return 0; }
         if (msh_read_exact(fd, pbuf, pn) < 0) { msh_server_drop(s, slot); return 0; }
         msh_stream_write(stream, pbuf, pending);
         store64(slot + 16, 0);
@@ -188,19 +220,64 @@ fn msh_server_service(s, slot): i64 {
     if (r == 0) { return 0; }                        # nothing pending
     if (r < 0) { msh_server_drop(s, slot); return 0; } # EOF / error
     var kind = msh_msg_kind(m);
+    # Require the EXACT arity each opcode is defined to carry before any branch reads
+    # an argument. Cheap, and it closes the whole class rather than one instance.
+    var argc = msh_msg_argc(m);
+    if (kind == MSH_HELLO)     { if (argc != 2) { return msh_srv_err_drop(s, slot, fd); } }
+    if (kind == MSH_WRITE)     { if (argc != 1) { return msh_srv_err_drop(s, slot, fd); } }
+    if (kind == MSH_WRITE_SHM) { if (argc != 2) { return msh_srv_err_drop(s, slot, fd); } }
+    if (kind == MSH_GAIN)      { if (argc != 1) { return msh_srv_err_drop(s, slot, fd); } }
+    if (kind == MSH_BYE)       { if (argc != 0) { return msh_srv_err_drop(s, slot, fd); } }
     if (kind == MSH_HELLO) {
-        var st = msh_stream_new(msh_msg_arg(m, 0), msh_msg_arg(m, 1));
+        # A stream on this slot already means the client is re-negotiating, and the
+        # protocol has no re-negotiate semantics. Before 0.5.6 a second HELLO built a
+        # SECOND stream, registered it, and overwrote slot+8 with it — orphaning the
+        # first in the router table where no drop path could ever reach it (drop only
+        # removes the id currently in the slot). 32 HELLOs on ONE socket therefore
+        # permanently filled all MSH_MAX_STREAMS slots and locked every future app out
+        # of the mixer for the life of the daemon. Refuse and drop.
+        if (stream != 0) { msh_srv_err(fd, MISHRAN_ERR_UNSUPPORTED, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
+        var hrate = msh_msg_arg(m, 0);
+        var hch   = msh_msg_arg(m, 1);
+        # VALIDATE BEFORE ALLOCATING. Every downstream size is derived from these two.
+        if (hrate < MSH_MIN_RATE) { msh_srv_err(fd, MISHRAN_ERR_FORMAT, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
+        if (hrate > MSH_MAX_RATE) { msh_srv_err(fd, MISHRAN_ERR_FORMAT, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
+        if (hch < MSH_MIN_CH)     { msh_srv_err(fd, MISHRAN_ERR_FORMAT, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
+        if (hch > MSH_MAX_CH)     { msh_srv_err(fd, MISHRAN_ERR_FORMAT, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
+        var st = msh_stream_new(hrate, hch);
+        if (st == 0) { msh_srv_err(fd, MISHRAN_ERR_OOM, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
+        # Register FIRST, and only adopt the stream into the slot once the router has
+        # actually taken it — otherwise a full table leaves the slot pointing at a
+        # stream the mixer will never see, and the client gets a WELCOME carrying an
+        # error code as its id (msh_router_add's old return collided with id 1).
         var id = msh_router_add(load64(s + 8), st);
+        if (id < 0) { msh_srv_err(fd, MISHRAN_ERR_OOM, msh_server_rbuf(s));
+            msh_server_drop(s, slot); return 0; }
         store64(slot + 8, st);
         # Reply WELCOME by reusing the server message (its HELLO args are consumed).
         msh_msg_set(m, MSH_WELCOME, 1);
         msh_msg_set_arg(m, 0, id);
-        msh_send(fd, m);
+        if (msh_send(fd, m) < 0) { msh_server_drop(s, slot); }
         return 0;
     }
     if (kind == MSH_WRITE) {
         if (stream == 0) { return 0; }               # WRITE before HELLO — ignore
         var nframes = msh_msg_arg(m, 0);
+        # CLAMP BEFORE THE MULTIPLY. nframes is straight off the wire. Unbounded, it
+        # made `nframes * ch * 2` overflow i64 into a NEGATIVE byte count that sailed
+        # past the backpressure test (a negative is never >= a positive free count),
+        # produced a NULL/undersized scratch, and was then handed to a copy. Bounding
+        # nframes itself — not the product — means the multiply can never be what
+        # overflows. MSH_SHM_BLOCK_FRAMES is already the ceiling msh_client_write
+        # chunks to, so nothing legitimate is refused.
+        if (nframes <= 0)                    { return msh_srv_err_drop(s, slot, fd); }
+        if (nframes > MSH_SHM_BLOCK_FRAMES)  { return msh_srv_err_drop(s, slot, fd); }
         var wsamp = nframes * msh_stream_channels(stream);
         # Backpressure: if the ring can't hold this chunk, LATCH nframes and leave
         # the payload in the socket (TCP backs up → the client's write blocks). A
@@ -210,6 +287,7 @@ fn msh_server_service(s, slot): i64 {
             if (msh_stream_free(stream) < wsamp) { store64(slot + 16, nframes); return 0; }
         }
         var pcm = msh_server_pcm(s, wsamp * 2);
+        if (pcm == 0) { msh_server_drop(s, slot); return 0; }
         if (msh_read_exact(fd, pcm, wsamp * 2) < 0) { msh_server_drop(s, slot); return 0; }
         msh_stream_write(stream, pcm, nframes);
         return 0;
@@ -217,10 +295,36 @@ fn msh_server_service(s, slot): i64 {
     if (kind == MSH_WRITE_SHM) {
         var shframes = msh_msg_arg(m, 0);
         var shbuf    = msh_msg_arg(m, 1);
-        store64(slot + 32, shbuf);       # remember the client's buffer for abnormal-drop reclaim
+        # Same clamp as MSH_WRITE, and for the same reason — this branch reaches the
+        # identical msh_stream_write with the identical unbounded frame count.
+        if (shframes <= 0)                   { return msh_srv_err_drop(s, slot, fd); }
+        if (shframes > MSH_SHM_BLOCK_FRAMES) { return msh_srv_err_drop(s, slot, fd); }
         # WRITE before HELLO — no stream to feed; ACK anyway so the (misbehaving)
-        # client doesn't hang waiting to reclaim its buffer.
-        if (stream == 0) { msh_srv_ack(fd, shbuf, msh_server_rbuf(s)); return 0; }
+        # client doesn't hang waiting to reclaim its buffer. Note this happens BEFORE
+        # the buffer is bound below: an un-HELLO'd socket must not get to register an
+        # id, or it could name someone else's and have the server reclaim it on drop.
+        if (stream == 0) {
+            if (msh_srv_ack(fd, shbuf, msh_server_rbuf(s)) < 0) { msh_server_drop(s, slot); }
+            return 0;
+        }
+        # BIND ON FIRST USE. A client announces exactly one reusable buffer
+        # (msh_client_connect creates one and msh_client_write reuses it), so the first
+        # id this slot presents is the only id it may ever present. Before 0.5.6 the
+        # server acted on whatever id arrived and stored it for abnormal-drop reclaim,
+        # so client A could name client B's buffer: the server would read B's audio
+        # into A's stream, ACK it (releasing a credit B never spent), and on A's
+        # abnormal drop UNLINK B's buffer out from under it — B's next write then
+        # failed ENOENT. Binding closes the cross-client read, the cross-client free
+        # and the multi-buffer strand together, with no protocol change.
+        #
+        # Scoped honestly: on Linux these are mode-0600 tmpfs files owned by one uid,
+        # so this is a confused-deputy robustness fix, not a privilege boundary. It
+        # becomes materially more serious on agnos, where ids index a GLOBAL kernel
+        # table of only 16 slots.
+        var bound = load64(slot + 32);
+        if (bound == 0) { store64(slot + 32, shbuf); bound = shbuf; }
+        if (bound != shbuf) { return msh_srv_err_drop(s, slot, fd); }
+        shbuf = bound;
         var shsamp = shframes * msh_stream_channels(stream);
         # Backpressure: if the ring can't hold this block, LATCH it (frames + shm
         # buf id) and DON'T ack — the PCM stays safe in the client-owned shm buffer,
@@ -237,13 +341,27 @@ fn msh_server_service(s, slot): i64 {
             }
         }
         var shpcm = msh_server_pcm(s, shsamp * 2);
+        if (shpcm == 0) { msh_server_drop(s, slot); return 0; }
         if (msh_shm_read(shbuf, shpcm, shsamp * 2) < 0) { msh_server_drop(s, slot); return 0; }
         msh_stream_write(stream, shpcm, shframes);
-        msh_srv_ack(fd, shbuf, msh_server_rbuf(s));   # consumed -> release the client's buffer credit
+        # consumed -> release the client's buffer credit
+        if (msh_srv_ack(fd, shbuf, msh_server_rbuf(s)) < 0) { msh_server_drop(s, slot); }
         return 0;
     }
     if (kind == MSH_GAIN) {
-        if (stream != 0) { msh_stream_set_gain(stream, msh_msg_arg(m, 0)); }
+        # Clamp the wire gain on INGEST. msh_stream_set_gain is a bare store64, and
+        # msh_mix later evaluates `sample * gain` as a plain i64 multiply BEFORE the
+        # S16 clamp sees it — so a gain past ~2^48 wraps the product and the clamp then
+        # faithfully saturates an already-garbage value, frequently to the WRONG rail.
+        # Bounding it also stops one client pinning the SHARED mix with a merely large
+        # (non-overflowing) gain like 100000. msh_mix clamps defensively too, so the
+        # library is safe for any caller, not just this dispatch path.
+        if (stream != 0) {
+            var gq = msh_msg_arg(m, 0);
+            if (gq < 0)               { gq = 0; }
+            if (gq > MSH_MAX_GAIN_Q8) { gq = MSH_MAX_GAIN_Q8; }
+            msh_stream_set_gain(stream, gq);
+        }
         return 0;
     }
     if (kind == MSH_BYE) {
@@ -251,7 +369,11 @@ fn msh_server_service(s, slot): i64 {
         msh_server_drop(s, slot);
         return 0;
     }
-    return 0;
+    # An opcode the server does not implement (or a server-to-client kind arriving
+    # from a client) is a protocol violation, not something to ignore silently: a peer
+    # sending them is either broken or probing, and either way it should be told and
+    # disconnected rather than left looping.
+    return msh_srv_err_drop(s, slot, fd);
 }
 
 # Poll the server: accept one new client, then service every registered client
