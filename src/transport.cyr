@@ -13,7 +13,7 @@
 # mishran's own 7701 wire was never re-tested post-fix, so the honest statement is that it was
 # NEVER HONESTLY DEMONSTRATED on agnos — not that it could not work. Do not claim either.
 # ⛔ The claim below — "cross-platform by construction ... the same wire runs on Linux and the
-# sovereign kernel" — was NOT ESTABLISHED for agnos. The replacement is the agnos socket (`naadi`), agnos
+# sovereign kernel" — was NOT ESTABLISHED for agnos. The replacement is the agnos socket (`anu`), agnos
 # `docs/development/planning/ipc.md` §9/§10; per §10.3 this whole socket body comes out,
 # including the `SO_REUSEADDR` that exists only to survive a restart race a placed channel
 # cannot have. Do NOT build on this file, and do NOT copy it into a new local IPC path.

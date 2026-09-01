@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > src == dst so the handshake closed **only under the hook**. On an ordinary boot mishran's
 > two-proc loopback path could not connect at all. The hook, its `build.sh` define and the
 > smoke script were all **deleted 2026-08-03**. TCP-on-loopback is not the local IPC transport —
-> the replacement is the agnos socket (`naadi`), agnos `docs/development/planning/ipc.md` §9-§10.
+> the replacement is the agnos socket (`anu`), agnos `docs/development/planning/ipc.md` §9-§10.
 > Individual claims below carry inline markers. History is preserved deliberately; do not cite it
 > as proof, and do not re-add the hook under any name.
 
@@ -37,7 +37,7 @@ unbounded facts. Those absolutes are not supported, and `dist/mishran.cyr` ships
   **mishran's own 7701 wire was never re-tested post-fix.** So the honest statement is that it was
   **never honestly demonstrated on agnos** — not that it could not work. Neither claim should be made.
 - **The transport is retired as the WRONG PRIMITIVE for local IPC, not because it was broken.**
-  Replacement is the agnos socket (`naadi`), agnos `docs/development/planning/ipc.md` §9; the removal
+  Replacement is the agnos socket (`anu`), agnos `docs/development/planning/ipc.md` §9; the removal
   inventory is §10 of the same doc.
 
 Changed: `src/transport.cyr` (file banner), `README.md`, this file, and `dist/mishran.cyr` regenerated
@@ -153,7 +153,7 @@ the same ones setu's present uses).
 > assigned `net_ip = 0x7F000001`; without it the two procs could not complete a loopback
 > handshake at all *in that era* (before `net_src_for`, agnos 1.56.34), so nothing was proven about block ceilings on agnos. Note also that "only a
 > tiny control message rides TCP" is **not** the design going forward: local control messages
-> move to the agnos socket (`naadi`). The shm PCM payload path is unaffected by this retraction.
+> move to the agnos socket (`anu`). The shm PCM payload path is unaffected by this retraction.
 > See agnos `docs/development/planning/ipc.md` §9-§10.
 
 This cut also **closes the serving-loop heap leak** the shm bite's adversarial-verify
@@ -240,7 +240,7 @@ allocates in its per-poll / per-block hot path, so a genuinely long-running mixe
 > could. Hook, define and smoke were deleted 2026-08-03. What **survives**: the cooperative-yield
 > mechanism itself (`msh_router_pump_nb`, the `sched_yield` backoffs) is sound engineering and is
 > unchanged — it simply has no valid agnos demonstration and must be re-proven over the agnos
-> socket (`naadi`). What **dies**: the TCP-loopback wire as mishran's local transport, and the
+> socket (`anu`). What **dies**: the TCP-loopback wire as mishran's local transport, and the
 > sub-window chunking workaround built to accommodate it. See agnos
 > `docs/development/planning/ipc.md` §9-§10 and `planning/blocking-syscall-concurrency.md`.
 
@@ -296,7 +296,7 @@ agnos planning note `docs/development/planning/blocking-syscall-concurrency.md`.
   `build.sh` define and `mishran-duplex-audio-smoke.sh` are **deleted** — do not look for the
   script and do not re-add the define under any name. The RMS/PEAK numbers are not evidence of a
   working two-proc path on agnos. `mishduplex.cyr` / `mishclient.cyr` remain in `programs/` as
-  the shape to re-target onto the agnos socket (`naadi`); the sub-window chunking note above is
+  the shape to re-target onto the agnos socket (`anu`); the sub-window chunking note above is
   a retired accommodation to a transport that is itself retired. See agnos
   `docs/development/planning/ipc.md` §9-§10.
 - **Agnos audio proof — the mixer plays on the sovereign kernel.** `programs/mishtone.cyr`

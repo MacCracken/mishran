@@ -1,7 +1,7 @@
 # programs/mishrand.cyr — the mishran mixing DAEMON (the runnable server).
 #
 # ⛔⛔ THE TRANSPORT THIS DAEMON LISTENS ON IS RETIRED (2026-08-03). TCP-on-loopback is NOT
-# the local IPC transport — operator ruling. The replacement is the agnos socket (`naadi`,
+# the local IPC transport — operator ruling. The replacement is the agnos socket (`anu`,
 # agnos `docs/development/planning/ipc.md` §9). Read the loopback:7701 wiring below as the
 # SHAPE to re-target, not as the shipping design. The related `MISHRAN_DUPLEX_SELFTEST`
 # kernel hook (which assigned `net_ip = 0x7F000001` so a loopback connect could match a

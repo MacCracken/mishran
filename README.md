@@ -38,10 +38,10 @@ processes can share the one hardware writer. Proven on agnos: a
 > SYN's SOURCE, so before `net_src_for` (agnos 1.56.34) the client's loopback connect could not
 > match a 4-tuple and the two procs could not talk at all. Hook and smoke are
 > **deleted**. **TCP-on-loopback is not the local IPC transport** — the
-> replacement is the agnos socket (`naadi`), agnos
+> replacement is the agnos socket (`anu`), agnos
 > `docs/development/planning/ipc.md` §9-§10. The routing server, the client API
 > and the cooperative-yield pump are unaffected as *code*; they need re-targeting
-> onto `naadi` and re-proving there. Do not re-add the hook under any name.
+> onto `anu` and re-proving there. Do not re-add the hook under any name.
 
 - `src/error.cyr` — `MishranErr` codes + `mishran_err_*` helpers.
 - `src/stream.cyr` — `MshStream`: id, `MshFormat` (S16/F32), sample rate,

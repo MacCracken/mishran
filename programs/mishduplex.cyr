@@ -5,7 +5,7 @@
 # `MISHRAN_DUPLEX_SELFTEST` kernel hook, which assigned `net_ip = 0x7F000001` — the only reason a
 # loopback TCP connect could match its 4-tuple on agnos. Hook and smoke are DELETED. The
 # two-proc / cooperative-yield finding may survive; the claim that it was proven over TCP on agnos
-# does not, and must be re-established on the agnos socket (`naadi`) — agnos
+# does not, and must be re-established on the agnos socket (`anu`) — agnos
 # `docs/development/planning/ipc.md` §9/§10.
 # ⛔ "the PROVEN desktop topology" below is likewise retracted: the aethersafha↔puka bind-then-spawn
 # topology was only ever demonstrated under the same class of kernel selftest hook
