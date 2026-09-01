@@ -55,11 +55,3 @@ stdlib = [
     "net",      # cross-platform TCP sockets (tcp_socket/sock_*) — the server transport
 ]
 
-# vani — the output sink (audio device I/O: ALSA/OSS on Linux, snd #64-69 on
-# agnos). WIRED as of 0.2.0: msh_router_open opens a vani PCM device and
-# msh_router_pump streams the mixed block to it (msh_router_open / _pump /
-# _close in route.cyr). vani-core is VENDORED at vendor/vani-core.cyr (copied
-# from vani's dist/vani-core.cyr), NOT a git `[deps.vani]`: since vani's 0.9.9
-# all-stdlib cut, a git dep drags in vani's full [deps].stdlib
-# (yukti/patra/chrono) that the core `audio_*` shim never needs. Mirrors
-# cyrius-doom / -polyomino / -bb. Refresh: re-copy the bundle on a vani release.
