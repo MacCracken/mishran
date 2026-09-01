@@ -17,6 +17,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Individual claims below carry inline markers. History is preserved deliberately; do not cite it
 > as proof, and do not re-add the hook under any name.
 
+## [Unreleased]
+
+### Fixed — `msh_router_pump` silently destroyed audio on any short sink write
+
+`audio_write(dev, buf, frames)` returns the **frame count accepted**, or negative on error
+(`vendor/vani-core.cyr:1051`; its agnos branch says so outright — "returns frames actually
+accepted (may short if interrupted) — the same contract the Linux WRITEI path exposes, **so
+callers loop**"). `route.cyr`'s own comment above the call site stated the contract correctly.
+The code then ignored it:
+
+```
+var w = audio_write(sink, mixbuf, MSH_PUMP_FRAMES);
+if (w == 0 - 32) { audio_prepare(sink); w = audio_write(sink, mixbuf, MSH_PUMP_FRAMES); }
+if (w < 0) { return MISHRAN_ERR_SINK_WRITE; }
+return MISHRAN_OK;
+```
+
+Only the sign was checked. Any `0 <= w < MSH_PUMP_FRAMES` returned `MISHRAN_OK` while
+`MSH_PUMP_FRAMES - w` frames were discarded — and they were **unrecoverable**, because `msh_mix`
+had already *consumed* those frames out of every registered stream's ring and `mixbuf` is a
+per-tick allocation nothing revisits. Dropped audio, no error to the caller.
+
+(The old XRUN retry itself was *sound*: it fired only when the **first** write returned exactly
+`-EPIPE`, in which case nothing had been accepted, so replaying the whole block was correct. The
+single defect is the unchecked short write.)
+
+**This is PRE-EXISTING, not introduced by the 0.5.5 toolchain bump.** All eight `audio_*` entry
+points were byte-identical in signature across vani 1.1.0 -> 1.2.2 (0.5.5 verified exactly that);
+the defect is mishran's, and predates the bump. It was found *during* that bump and deliberately
+left out of it as out of scope.
+
+Upstream vani hit this same bug shape in `vani_play_from_ring` and fixed it at **1.2.0**
+("destroyed audio on any short write", MEDIUM). Its remedy — peek the ring, write, then consume
+only what the device accepted — **does not transfer**: a mixdown has no ring to un-consume, and the
+`core` profile mishran vendors carries no `_vani_recovery_for` helper, so mishran owns this policy
+itself. The policy adopted here is to **drain the remainder in-call**:
+
+- loop while frames remain, writing `mixbuf + done * bpf` for `MSH_PUMP_FRAMES - done`, advancing
+  `done` by the count actually accepted (`bpf = channels * 2`, S16_LE interleaved);
+- `-EPIPE` re-prepares and replays **the remainder only**, not the whole block. This generalises
+  the old once-only retry, and is load-bearing now that an underrun can arrive **mid-drain** with
+  `done > 0`: replaying from the start there would re-send frames the device already took;
+- a budget of `MSH_PUMP_WRITE_TRIES` (16) bounds **no-progress** attempts only — a zero-frame write
+  or an XRUN. Attempts that accept frames are free, so a slow-but-draining sink is never failed,
+  while a wedged one still terminates;
+- exhausting that budget returns the new **`MISHRAN_ERR_SINK_SHORT`** (8, "sink short write"),
+  distinct from `MISHRAN_ERR_SINK_WRITE` (7) so a caller can tell "the device rejected this" from
+  "the device took part of it and stalled".
+
+`msh_router_pump_nb` had a **related but different** flaw, and takes a **different** fix. It gates
+on `audio_avail(sink) >= MSH_PUMP_FRAMES` first, so a short write there is anomalous rather than
+routine — but it was still discarded silently by the same `if (wn < 0)`-only check. It must **not**
+grow a drain loop: a loop-until-whole-block write is precisely what would hog the pump, stop
+draining the concurrent client proc and starve the mix into silence (the serial-kstack invariant —
+the kernel cannot preempt a blocking syscall). So it reports `MISHRAN_ERR_SINK_SHORT` and returns,
+preserving the non-blocking contract. Carrying the remainder across ticks would need a router-owned
+mixbuf with a pending offset — that is the existing `TODO(v0.2)` in the file, not this fix.
+
+⚠ **Not verified against real hardware.** This host has no PCM playback node (`/dev/snd` has
+`controlC0`/`controlC1` only), so `pump_probe`, `mishtone` and `mishrand` self-skip with
+"no audio device" exactly as in 0.5.5 — `pump_probe` exits 2, its documented degrade-clean path.
+**The fixed write path has therefore NOT been exercised against a real DAC**, and a short write is
+by nature a hardware/timing event. What *was* verified is the loop itself, offline: the body was
+transcribed verbatim against a scriptable fake sink, asserting on every call that it is handed
+exactly `mixbuf + accepted * bpf` for exactly the remainder (no gap, no overlap, no re-send).
+Cases: ideal one-shot drain; a 300-frames-per-call sink (the regression — pre-fix this returned
+`OK` having emitted 300 of 1024) draining all 1024; a 1-frame-per-call sink draining all 1024
+without tripping the budget; XRUN-then-drain replaying only the remainder; a wedged sink
+terminating with `SINK_SHORT`; a hard error surfacing `SINK_WRITE`. All pass. That validates the
+arithmetic and the termination bound — it does not substitute for a device.
+
+RUN suites on this host: `gain_probe`, `resample_probe`, `shm_probe` (A/B/C), `client_leak_probe`
+(0 bytes steady-state growth on both hot paths) and `serve_probe` all **PASS**. `cyrius build`,
+`cyrius lint src/route.cyr` (2 untracked deferrals, both pre-existing — unchanged in count and
+kind), `cyrius fmt src/route.cyr --check` (clean, no rewrite) and `cyrius distlib --check` green.
+`dist/mishran.cyr` and `dist/mishran.deps` regenerated and committed together; the sidecar's 14
+leaves are unchanged by this fix.
+
 ## [0.5.5] - 2026-08-31
 
 ### Changed — cyrius pin 6.5.5 -> 6.5.36

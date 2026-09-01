@@ -23,6 +23,7 @@ enum MishranErrCode {
     MISHRAN_ERR_NO_SINK     = 5;   # no output sink open (router has no vani handle)
     MISHRAN_ERR_UNSUPPORTED = 6;   # valid request but a feature mishran can't do yet
     MISHRAN_ERR_SINK_WRITE  = 7;   # vani sink write failed after XRUN re-prepare
+    MISHRAN_ERR_SINK_SHORT  = 8;   # sink took only part of the block and would not drain the rest
     MISHRAN_ERR_OTHER       = 99;  # catch-all
 }
 
@@ -66,6 +67,7 @@ fn mishran_err_name(code): i64 {
     if (code == MISHRAN_ERR_NO_SINK)     { return "no output sink"; }
     if (code == MISHRAN_ERR_UNSUPPORTED) { return "unsupported feature"; }
     if (code == MISHRAN_ERR_SINK_WRITE)  { return "sink write failed"; }
+    if (code == MISHRAN_ERR_SINK_SHORT)  { return "sink short write"; }
     if (code == MISHRAN_ERR_OTHER)       { return "other error"; }
     return "unknown error";
 }

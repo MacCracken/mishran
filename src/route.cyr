@@ -18,6 +18,10 @@
 enum MshRouterCap {
     MSH_MAX_STREAMS = 32;
     MSH_PUMP_FRAMES = 1024;   # frames mixed per pump tick
+    # Budget of NO-PROGRESS sink-write attempts per pump tick (a zero-frame
+    # write or an XRUN re-prepare). Attempts that accept frames are free, so a
+    # slow-but-draining sink is never failed; only a stalled one is.
+    MSH_PUMP_WRITE_TRIES = 16;
 }
 
 # ----------------------------------------------------------------
@@ -152,17 +156,41 @@ fn msh_router_pump(r): i64 {
     msh_apply_gain(mixbuf, total, load64(r + 48));
 
     # Push the mixed block to the vani sink. audio_write returns the frame count
-    # accepted, or negative on error; -EPIPE (0 - 32) is an ALSA underrun — re-prepare
-    # and replay the block once (the doom/dhvani idiom, since the core audio_* shim
-    # leaves XRUN recovery to the caller).
+    # ACCEPTED — which may be SHORT of what we asked for — or negative on error;
+    # -EPIPE (0 - 32) is an ALSA underrun — re-prepare and replay the remainder
+    # (the doom/dhvani idiom, since the core audio_* shim leaves XRUN recovery to
+    # the caller).
+    #
+    # We must drain the WHOLE block here: msh_mix above already CONSUMED these
+    # frames out of every stream ring, and mixbuf is a per-tick allocation that is
+    # never revisited, so anything we don't hand the device is destroyed. vani hit
+    # this same bug shape in vani_play_from_ring and fixed it at 1.2.0 ("destroyed
+    # audio on any short write"); upstream could peek-then-consume against the
+    # caller's ring, but a mixdown has no ring to un-consume — so mishran's policy
+    # is instead to loop on the remainder, advancing by the accepted count, and to
+    # report MISHRAN_ERR_SINK_SHORT rather than silently drop frames.
     var sink = load64(r + 0);
     if (sink == 0) { return MISHRAN_ERR_NO_SINK; }
-    var w = audio_write(sink, mixbuf, MSH_PUMP_FRAMES);
-    if (w == 0 - 32) {
-        audio_prepare(sink);
-        w = audio_write(sink, mixbuf, MSH_PUMP_FRAMES);
+    var bpf = ch * 2;             # bytes per frame — S16_LE interleaved
+    var done = 0;                 # frames the sink has accepted so far
+    var stalls = 0;               # no-progress attempts spent (see MSH_PUMP_WRITE_TRIES)
+    while (done < MSH_PUMP_FRAMES) {
+        var w = audio_write(sink, mixbuf + done * bpf, MSH_PUMP_FRAMES - done);
+        if (w == 0 - 32) {
+            # Underrun: re-prepare and replay from where the device stopped.
+            audio_prepare(sink);
+            stalls = stalls + 1;
+            if (stalls > MSH_PUMP_WRITE_TRIES) { return MISHRAN_ERR_SINK_SHORT; }
+            continue;
+        }
+        if (w < 0) { return MISHRAN_ERR_SINK_WRITE; }
+        if (w == 0) {
+            stalls = stalls + 1;
+            if (stalls > MSH_PUMP_WRITE_TRIES) { return MISHRAN_ERR_SINK_SHORT; }
+            continue;
+        }
+        done = done + w;
     }
-    if (w < 0) { return MISHRAN_ERR_SINK_WRITE; }
     return MISHRAN_OK;
 }
 
@@ -192,6 +220,14 @@ fn msh_router_pump_nb(r): i64 {
     msh_apply_gain(mixbuf, total, load64(r + 48));            # master level (Q8; no-op at unity)
     var wn = audio_write_nb(sink, mixbuf, MSH_PUMP_FRAMES);   # room was checked -> full block fits
     if (wn < 0) { return MISHRAN_ERR_SINK_WRITE; }
+    # A SHORT write here is anomalous — audio_avail said a whole block fit, and the
+    # DAC IRQ only ever frees more room (the router is the single hardware writer,
+    # so nothing else consumes it). But msh_mix already consumed these frames and
+    # this pump must NOT loop to drain the rest: a loop-until-whole-block write is
+    # exactly what would hog the pump and starve the concurrent client proc (see the
+    # header above). So we report the loss instead of retrying it — same policy as
+    # the blocking pump, minus the retries it can afford.
+    if (wn < MSH_PUMP_FRAMES) { return MISHRAN_ERR_SINK_SHORT; }
     return MISHRAN_OK;
     #else
     return msh_router_pump(r);
