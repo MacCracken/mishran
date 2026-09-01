@@ -17,6 +17,140 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > Individual claims below carry inline markers. History is preserved deliberately; do not cite it
 > as proof, and do not re-add the hook under any name.
 
+## [0.5.5] - 2026-08-31
+
+### Changed — cyrius pin 6.5.5 -> 6.5.36
+
+Thirty-one releases of catch-up.
+
+⚠ **0.5.3 said "the pin was documentation, not enforcement". That is only half true, and the
+half that is false matters.** Tested directly by pointing a scratch manifest at an uninstalled
+`6.5.99`:
+
+- **Verb dispatch IS enforced.** The `cyrius` wrapper re-execs into
+  `~/.cyrius/versions/<pin>/bin/cyrius`, and on a missing pin it prints
+  `error: cyrius.cyml pins version 6.5.99 but cyrius binary is not installed at ...` and stops.
+  So **6.5.36 must be installed before this bump lands**, or every `cyrius` verb in this tree
+  hard-fails. (The error advises `cyrius install <ver>`, which prints "Package registry not yet
+  available" and does nothing — the working path is the curl installer CI already uses. Release
+  `6.5.36` does carry `cyrius-6.5.36-x86_64-linux.tar.gz` **and** its required `.sha256`, verified
+  against the GitHub API, so the CI install step is good.)
+- **The COMPILER is not pinned.** `cycc` resolves through the `~/.cyrius/bin` symlink, not the
+  versioned directory — so a pinned-6.5.5 tree really was being compiled by 6.5.36, exactly as
+  0.5.3 warned. That half stands.
+
+This bump closes the gap either way: before it, every build printed
+`cyrius.cyml pins 6.5.5 but cycc is 6.5.36 — toolchain drift`, plus a warning that `./lib/`
+shadowed the pinned snapshot with two stale bundles (`sandhi 1.9.8` vs pinned 1.9.9,
+`vani 1.1.2` vs pinned 1.1.3). Both warnings are gone; `lib/` is now a clean `cyrius deps` resolve
+against 6.5.36 (35 files, no subdirectories — `mkdir lib` in CI remains sufficient).
+
+⭐ What the gap contained that a mishran reader should care about:
+- **6.5.28** ⚠ **BREAKING for scripts:** `cyrius fmt` now **REWRITES FILES IN PLACE**. `--dry` is
+  the old stdout-only behaviour. CI's `cyrius fmt "$f" --check` still does **not** write — verified
+  by running the full `--check` sweep over `src/` + `programs/` and confirming `git status` stayed
+  clean. The same release taught `cyrfmt` to track parentheses (canonical is 2 spaces per open-paren
+  level, 4 accepted); mishran's existing files pass unchanged, so there is **no fmt churn** here.
+- **6.5.28** `cyrius deps` read only the first **4095 bytes** of a manifest. `cyrius.cyml` is 2.2 KB
+  so mishran was always under the cliff — but worth knowing before the manifest grows.
+- **6.5.30** `cyrius distlib` emitted **no sidecar at all**, silently, when a manifest mentioned
+  "stdlib" in prose. mishran's `[package] description` does not, and its prose mentions are on
+  `#` comment lines, so the bundle was never affected — `dist/mishran.deps` has been emitted
+  correctly throughout.
+- **6.5.36** 🔴 enum constants ≥ 2^62 were silently corrupted in **6.5.31–6.5.35**. mishran declares
+  no such constants, but anything in the stack built by those five releases should be rebuilt.
+- **6.5.36** 🔴 on ELF-aarch64, `sys_pause()` issued `flock` and `sys_signalfd()` issued `fsync`.
+  mishran calls neither; relevant to the aarch64 desktop target.
+- **6.5.21 / 6.5.34** `CYRIUS_PKG_VERSION`, and then made to resolve from included files.
+
+### Changed — vendored vani 1.1.0 -> 1.2.2
+
+`vendor/vani-core.cyr` re-copied from vani's `dist/vani-core.cyr`. Still **vendored, not a git
+`[deps.vani]`** — the 0.9.9-era reasoning in `src/lib.cyr` is unchanged.
+
+The 1.1.0 -> 1.2.2 delta is **purely additive**: `audio_set_params_fmt` plus internal `_hwp_*`
+interval helpers and `_alsa_phys_bytes_for_bits`. **Zero** public functions were removed, and all
+eight `audio_*` entry points `route.cyr` calls — `audio_open_playback`, `audio_set_params`,
+`audio_write`, `audio_prepare`, `audio_drain`, `audio_close`, `audio_write_nb`, `audio_avail` —
+are **byte-identical in signature**. No call site changed.
+
+⚠ vani's own `dist/vani-core.deps` declares a `tagged` leaf. Grepping every symbol
+`lib/tagged.cyr` defines against the bundle finds **zero** references, so the sidecar over-declares
+for the `core` profile. `tagged` is deliberately **not** added to `[deps].stdlib`.
+
+### Fixed — `args` was a missing dependency, and every `--agnos` build had been warning about it
+
+`lib/io.cyr`'s `getenv` delegates to `args_agnos.cyr`'s `_agnos_getenv` under
+`#ifdef CYRIUS_TARGET_AGNOS` (the agnos ABI hands env on the stack, not via `envp`). `io.cyr` does
+**not** include `args` itself, and mishran declared neither the leaf nor the include — so
+**every** program in `programs/` emitted `undefined function '_agnos_getenv'` on `--agnos`.
+
+**This was not introduced by the bump.** 6.5.5's `io.cyr` has the identical call at the identical
+line. Two things hid it:
+- **Locally**, `lib/` was a `cyrius lib sync --full` snapshot (99 files) that happened to contain
+  `args_agnos.cyr`. The bump's `rm -rf lib && cyrius deps` resolve (31 files, now 35) drops
+  anything undeclared — which is what made the gap visible.
+- **In CI**, the resolve is already correct, but the only target built is the **linux** smoke
+  program, and `_agnos_getenv` is unreachable there.
+
+⚠ **And the root reason it could hide at all: `cyrius build` exits 0 on
+`warning: undefined function`** — verified, including under `--strict`. An `--agnos` build with the
+`args` dep deleted still prints `OK` and returns 0. Nothing in CI inspects build output, so CI
+cannot catch the next one of these either. Worth a gate; not added here.
+
+Fixed by declaring the leaf in `cyrius.cyml` `[deps].stdlib` and adding `include "lib/args.cyr"` to
+`src/lib.cyr` (args.cyr is the public include point — it selects `args_agnos`/`args_macos`/`args_win`
+by target itself). A full undefined-symbol sweep — every program in `programs/` x
+{linux-x86_64, `--agnos`, `--aarch64`, `--win`} — now reports **zero** undefined symbols except the
+known-and-documented `sys_sched_yield` / `sys_spawn_path` in `mishclient` / `mishduplex` on
+non-agnos targets, which are agnos-only by design and unchanged since 0.5.3.
+
+⚠ **Consumers must add `args` to their own `[deps].stdlib`.** `dist/mishran.deps` now declares
+**14** leaves, up from 13.
+
+### Changed — the dist gate now checks the sidecar it always should have
+
+CI's dist staleness gate ran `cyrius distlib` then `git diff --quiet dist/mishran.cyr`, which gates
+**only** the bundle. `dist/mishran.deps` is equally git-tracked, is what `cyrius deps` reads to
+check a *consumer's* `[deps].stdlib`, and **drifted this very release** (13 -> 14 leaves) — a
+sidecar-only drift passed that gate silently, and per cyrius 6.5.10 a wrong sidecar switches the
+consumer-side check OFF. Replaced with `cyrius distlib --check` (6.5.36), which compares bytes,
+covers both files, and writes nothing. Verified: exits 0 clean, 1 on a doctored `.cyr`, **and** 1
+on a `.deps` with `args` removed — the exact case the old gate missed.
+
+`release.yml` gets the same call, but as a **refusal** rather than a regeneration: `git archive HEAD`
+packages the committed tree while the `cp dist/mishran.cyr` beside it copies the working tree, so a
+bare `cyrius distlib` there could ship two different bundles under one tag, both attested by
+`SHA256SUMS`.
+
+### Verification
+
+Clean-tree gate at the new pin, matching CI step for step: `cyrius lint` clean over `src/` +
+`programs/`; `cyrius fmt --check` clean with no file rewritten; `cyrius vet programs/smoke.cyr`
+`1 deps, 0 untrusted, 0 missing`; `cyrius distlib --check` current; `CYRIUS_DCE=1 cyrius build`
+green with a valid ELF; `cyrius audit` reports fmt + lint clean.
+
+Every program in `programs/` builds — `mishclient` / `mishduplex` on `--agnos` only, as ever.
+RUN suites: `gain_probe` PASS, `resample_probe` PASS, `shm_probe` PASS (A/B/C),
+`client_leak_probe` PASS (0 bytes steady-state growth on both hot paths), `serve_probe` PASS.
+`pump_probe`, `mishtone` and `mishrand` self-skip with "no audio device" on this host — **the vani
+sink path is therefore NOT re-verified against hardware by this release**, and 1.2.2's ALSA
+hw-params changes are the part of the vani bump that most deserves a real device. Not a regression
+claim either way; simply untested here.
+
+### Known gate gaps — flagged, not fixed
+
+- **The "Test (RUN suites)" step is vacuous.** It globs `programs/*_test.cyr` (none exist) and
+  `tests/tcyr/*.tcyr` (no such directory), and both loops are `[ -e ] || continue`, so the step
+  exits 0 having run nothing. The probes listed above are real and passing — but by hand.
+- **The Lint step cannot see deferrals**, despite its own comment claiming "any `warn` line
+  (warning or untracked-deferral) fails CI". Deferrals print as
+  `  deferral line N: untracked ...`, which its `^[[:space:]]*warn ` grep never matches. There are
+  **12** untracked deferrals in `src/` right now (mix 2, route 2, server 6, stream 2). Note
+  `cyrius lint --strict-deferrals` is not plumbed through the wrapper; the raw `cyrlint` takes it.
+- **`cyrius deps` prints nothing on success** at 6.5.36, so a partial resolve reads identically to
+  a good one in the CI log.
+
 ## [0.5.4] - 2026-08-03
 
 ### Fixed — the transport retraction over-reached and claimed more than the evidence supports

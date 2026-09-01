@@ -5,7 +5,7 @@ description = "mishran (मिश्रण — mixing) — pure-Cyrius software 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/mishran"
 language = "cyrius"
-cyrius = "6.5.5"
+cyrius = "6.5.36"
 
 # mishran is a library — no CLI binary yet. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
@@ -44,6 +44,7 @@ stdlib = [
     "fmt",
     "alloc",
     "io",
+    "args",     # io.cyr's agnos getenv path calls args_agnos.cyr's _agnos_getenv
     "vec",
     "str",
     "syscalls",

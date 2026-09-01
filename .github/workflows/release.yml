@@ -72,8 +72,18 @@ jobs:
           done
           for f in tests/tcyr/*.tcyr; do [ -e "$f" ] || continue; cyrius test "$f" || exit 1; done
 
-      - name: Regenerate dist bundle
-        run: cyrius distlib
+      - name: Verify dist bundle is in sync with src/
+        # REFUSE rather than regenerate. `git archive ... HEAD` below packages the
+        # COMMITTED tree while the `cp dist/mishran.cyr` next to it copies the
+        # WORKING tree — so a bare `cyrius distlib` here would let a stale commit
+        # ship two different bundles under one tag, both attested by SHA256SUMS.
+        # --check covers dist/mishran.deps too and writes nothing.
+        run: |
+          if ! cyrius distlib --check; then
+            echo "ERROR: dist/ is stale at this tag. Commit the regenerated"
+            echo "       dist/mishran.cyr + dist/mishran.deps and re-tag."
+            exit 1
+          fi
 
       - name: Clean toolchain artifacts
         run: rm -f cyrius-*.tar.gz

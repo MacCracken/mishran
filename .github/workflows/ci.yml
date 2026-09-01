@@ -71,14 +71,20 @@ jobs:
         run: cyrius vet programs/smoke.cyr
 
       - name: Verify dist bundle is in sync with src/
+        # `cyrius distlib --check` (6.5.36) compares BYTES and writes nothing. It
+        # replaces the old `distlib` + `git diff dist/mishran.cyr` pair because that
+        # gate gated ONLY the .cyr: dist/mishran.deps is equally git-tracked, is the
+        # sidecar `cyrius deps` reads to check a CONSUMER's [deps].stdlib, and it
+        # drifted this release (13 -> 14 leaves, `args`) — a sidecar-only drift
+        # passed the old gate silently, and per cyrius 6.5.10 a wrong sidecar turns
+        # the consumer-side check OFF.
         run: |
-          cyrius distlib
-          if ! git diff --quiet dist/mishran.cyr; then
-            echo "ERROR: dist/mishran.cyr is stale. Run 'cyrius distlib' and commit the result."
-            git --no-pager diff dist/mishran.cyr | head -40
+          if ! cyrius distlib --check; then
+            echo "ERROR: dist/ is stale. Run 'cyrius distlib' and commit BOTH"
+            echo "       dist/mishran.cyr and dist/mishran.deps."
             exit 1
           fi
-          echo "dist/mishran.cyr matches src/"
+          echo "dist/ matches src/"
 
       - name: Build (link-check, DCE on)
         run: |

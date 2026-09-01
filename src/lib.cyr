@@ -19,6 +19,14 @@ include "lib/alloc.cyr"
 include "lib/vec.cyr"
 include "lib/str.cyr"
 include "lib/io.cyr"
+
+# args.cyr is io.cyr's TRANSITIVE requirement, not a direct one: on agnos,
+# io.cyr's `getenv` delegates to args_agnos.cyr's `_agnos_getenv` (the agnos
+# ABI hands env on the stack, not via envp). io.cyr does not include args
+# itself, so without this line every `--agnos` build of every program warns
+# `undefined function '_agnos_getenv'`. args.cyr is the public include point;
+# it selects args_agnos/args_macos/args_win by target itself.
+include "lib/args.cyr"
 include "lib/syscalls.cyr"
 include "lib/assert.cyr"
 include "lib/bench.cyr"
@@ -42,10 +50,14 @@ include "lib/net.cyr"
 # `[deps].stdlib` (yukti/patra/chrono) even though the core shim only needs
 # the base stdlib set already declared above. Vendoring compiles just the shim
 # against mishran's own stdlib list. Mirrors cyrius-doom / -polyomino / -bb.
-# (Provenance: vani 1.1.0.) route.cyr calls audio_open_playback /
+# (Provenance: vani 1.2.2.) route.cyr calls audio_open_playback /
 # audio_set_params / audio_write / audio_prepare / audio_drain / audio_close, plus
 # audio_write_nb / audio_avail (the non-blocking sink API new in vani 1.1.0, used by
 # the cooperative msh_router_pump_nb) — so this must precede src/route.cyr.
+# All eight are byte-identical in signature at 1.2.2; the 1.1.0 -> 1.2.2 delta is
+# purely ADDITIVE (audio_set_params_fmt + internal _hwp_* interval helpers), so no
+# route.cyr call site changed. vani's own dist/vani-core.deps lists a `tagged` leaf
+# the core profile does not actually reference — deliberately NOT added to [deps].
 # ================================================================
 include "vendor/vani-core.cyr"
 
