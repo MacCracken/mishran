@@ -58,9 +58,9 @@ fn msh_sigpipe_guard(): i64 {
 # fd (>= 0), or -2 (socket) / -3 (connect).
 fn msh_connect(): i64 {
     msh_sigpipe_guard();
-    var s = tcp_socket();
-    if (is_ok(s) == 0) { return 0 - 2; }
-    var fd = result_unwrap(s);
+    var st, sv = tcp_socket();
+    if (is_ok(st) == 0) { return 0 - 2; }
+    var fd = result_unwrap(st, sv);
     if (is_ok(sock_connect(fd, INADDR_LOOPBACK(), MSH_TCP_PORT)) == 0) {
         sock_close(fd);
         return 0 - 3;
@@ -72,9 +72,9 @@ fn msh_connect(): i64 {
 # -2 (socket) / -3 (bind) / -4 (listen). Non-blocking so msh_accept polls.
 fn msh_listen(): i64 {
     msh_sigpipe_guard();
-    var s = tcp_socket();
-    if (is_ok(s) == 0) { return 0 - 2; }
-    var fd = result_unwrap(s);
+    var st, sv = tcp_socket();
+    if (is_ok(st) == 0) { return 0 - 2; }
+    var fd = result_unwrap(st, sv);
     #ifndef CYRIUS_TARGET_AGNOS
     sock_reuse(fd);                                  # SO_REUSEADDR — rebind after a restart
     #endif
@@ -90,9 +90,9 @@ fn msh_listen(): i64 {
 # when none is pending. Non-blocking on both targets. The accepted fd is set
 # non-blocking (Linux) so the server can poll each client without stalling.
 fn msh_accept(sfd): i64 {
-    var a = sock_accept(sfd);
-    if (is_ok(a) == 0) { return 0 - 5; }             # EAGAIN / no client pending
-    var cfd = result_unwrap(a);
+    var at, av = sock_accept(sfd);
+    if (is_ok(at) == 0) { return 0 - 5; }            # EAGAIN / no client pending
+    var cfd = result_unwrap(at, av);
     #ifndef CYRIUS_TARGET_AGNOS
     sock_set_nonblocking(cfd);
     #endif

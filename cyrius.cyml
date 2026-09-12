@@ -5,7 +5,7 @@ description = "mishran (मिश्रण — mixing) — pure-Cyrius software 
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/mishran"
 language = "cyrius"
-cyrius = "6.5.36"
+cyrius = "6.6.2"
 
 # mishran is a library — no CLI binary yet. `cyrius build` targets a smoke
 # program that links the full include chain to prove lib.cyr parses clean.
@@ -20,9 +20,22 @@ output = "build/mishran-smoke"
 # error.cyr is dep-free; stream.cyr uses it; mix.cyr uses stream; route.cyr
 # owns the single sink and drives mix; then the server band — proto.cyr (wire
 # messages, dep-free), transport.cyr (TCP via net.cyr), server.cyr (accept +
-# dispatch + the app client). Consumers of the dist must supply `net` + `result`
-# in their own [deps].stdlib (transport.cyr's socket + Result deps). Don't reorder
-# without re-running `cyrius distlib` and verifying the bundle compiles clean.
+# dispatch + the app client). Don't reorder without re-running `cyrius distlib`
+# and verifying the bundle compiles clean.
+#
+# Consumers: `dist/mishran.deps` is the authority for what a consumer's own
+# [deps].stdlib must carry — read it, don't retype it here. ⛔ This line used to
+# say "`net` + `result`" and that was an UNDER-REPORT: route.cyr calls
+# audio_open_playback / audio_write_nb / audio_avail, which mishran satisfies
+# in-repo from the VENDORED vendor/vani-core.cyr — but `vendor/` is NOT a [lib]
+# module, so the bundle carries the CALLS with no definition and a consumer
+# building from the two named leaves got undefined `audio_*`. The sidecar was
+# pure inference under the old 6.5.36 pin and propagated the same gap. cyrius
+# 6.5.37's COMPILE-VERIFIED sidecar caught it at the 6.6.2 bump and re-added the
+# 9 missing leaves (vani + its transitive yukti/sakshi/patra/freelist/chrono/fs/
+# hashmap/process), 14 -> 23. Note this is exactly the transitive set the
+# vendoring above avoids for MISHRAN's build; it is unavoidable for a consumer
+# of the dist, which has no vendored shim.
 [lib]
 modules = [
     "src/error.cyr",
