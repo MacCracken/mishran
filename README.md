@@ -2,7 +2,7 @@
 
 **मिश्रण — mixing / mixture**
 
-Version: 0.5.6
+Version: 0.5.7
 
 Sovereign software **audio mixer + routing daemon** for AGNOS, written in
 pure Cyrius. mishran is the multi-stream fan-in layer the agnostic audio
